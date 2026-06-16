@@ -53,7 +53,8 @@ cd ../..
 # 4. Log in to Forge
 forge login
 
-# 5. Register the app (first time only — creates a new app ID for you)
+# 5. Register the app — this replaces the app.id in manifest.yml with your own
+#    (the ID in the repo belongs to the original author; you need your own)
 forge register
 
 # 6. Start the React dev server
