@@ -1,0 +1,14 @@
+{
+  "name": "plan-jira",
+  "version": "1.0.0",
+  "description": "Planyway-style planning tool for Jira",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'No root build needed'"
+  },
+  "dependencies": {
+    "@forge/api": "^4.0.0",
+    "@forge/resolver": "^1.0.0"
+  }
+}

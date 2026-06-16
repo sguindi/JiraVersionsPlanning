@@ -1,0 +1,35 @@
+{
+  "name": "plan-jira-ui",
+  "version": "1.0.0",
+  "homepage": ".",
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test --watchAll=false",
+    "test:watch": "react-scripts test"
+  },
+  "dependencies": {
+    "@forge/bridge": "^3.0.0",
+    "date-fns": "^3.6.0",
+    "react": "^18.0.0",
+    "react-big-calendar": "^1.8.7",
+    "react-dom": "^18.0.0",
+    "react-scripts": "^5.0.0",
+    "recharts": "^2.15.4"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version"
+    ]
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2"
+  }
+}

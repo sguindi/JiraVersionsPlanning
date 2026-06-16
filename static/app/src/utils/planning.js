@@ -1,0 +1,149 @@
+import { format, parseISO, addDays, getDay } from 'date-fns';
+
+export const HOURS_PER_DAY = 6;
+
+export function isWeekend(d) { const w = getDay(d); return w === 0 || w === 6; }
+
+export function addWorkingDays(startStr, n) {
+  let cur = parseISO(startStr);
+  let cnt = 0;
+  while (cnt < n) { cur = addDays(cur, 1); if (!isWeekend(cur)) cnt++; }
+  return format(cur, 'yyyy-MM-dd');
+}
+
+export function nextWorkDay(dateStr) { return addWorkingDays(dateStr, 1); }
+
+export function calcDays(roughHours, devCount) {
+  if (!roughHours || !devCount) return 1;
+  return Math.max(1, Math.ceil(roughHours / (devCount * HOURS_PER_DAY)));
+}
+
+export function calcEndDate(startStr, roughHours, devCount) {
+  if (!startStr) return null;
+  const extra = calcDays(roughHours, devCount) - 1;
+  return extra === 0 ? startStr : addWorkingDays(startStr, extra);
+}
+
+export function buildWorkingDays(fromStr, count) {
+  const days = [];
+  let cur = parseISO(fromStr);
+  while (days.length < count) {
+    if (!isWeekend(cur)) days.push(format(cur, 'yyyy-MM-dd'));
+    cur = addDays(cur, 1);
+  }
+  return days;
+}
+
+export function cascadePlan(plan, roughMap) {
+  if (!plan?.issues) return plan;
+  const issues = { ...plan.issues };
+  const dependents = {};
+  for (const [key, e] of Object.entries(issues)) {
+    for (const dep of (e.dependencies || [])) {
+      if (!dependents[dep]) dependents[dep] = [];
+      dependents[dep].push(key);
+    }
+  }
+  const inDeg = {};
+  for (const k of Object.keys(issues)) inDeg[k] = (issues[k].dependencies || []).length;
+  const queue = Object.keys(issues).filter(k => !inDeg[k]);
+  const order = [];
+  while (queue.length) {
+    const k = queue.shift(); order.push(k);
+    for (const dep of (dependents[k] || [])) { inDeg[dep]--; if (!inDeg[dep]) queue.push(dep); }
+  }
+  const newIssues = {};
+  for (const k of Object.keys(issues)) newIssues[k] = { ...issues[k] };
+  for (const k of order) {
+    const e = newIssues[k];
+    if (!(e.dependencies || []).length) continue;
+    let latestEnd = null;
+    for (const depKey of e.dependencies) {
+      const de = newIssues[depKey];
+      if (!de?.startDate) continue;
+      const devs = (de.assignedPlaceholders || []).length || 1;
+      const end = calcEndDate(de.startDate, roughMap[depKey], devs);
+      if (end && (!latestEnd || end > latestEnd)) latestEnd = end;
+    }
+    if (latestEnd) newIssues[k] = { ...e, startDate: nextWorkDay(latestEnd) };
+  }
+  return { ...plan, issues: newIssues };
+}
+
+export function detectConflicts(plan, roughMap) {
+  const result = [];
+  for (const ph of (plan.placeholders || [])) {
+    const assigned = Object.entries(plan.issues || {})
+      .filter(([, e]) => e.assignedPlaceholders?.includes(ph.id) && e.startDate)
+      .map(([key, e]) => {
+        const devs = (e.assignedPlaceholders || []).length || 1;
+        return { key, startDate: e.startDate, endDate: calcEndDate(e.startDate, roughMap[key], devs) || e.startDate };
+      })
+      .sort((a, b) => a.startDate.localeCompare(b.startDate));
+    for (let i = 0; i < assigned.length - 1; i++) {
+      if (assigned[i].endDate >= assigned[i + 1].startDate) {
+        result.push({ placeholder: ph, source: assigned[i].key, target: assigned[i + 1].key });
+      }
+    }
+  }
+  return result;
+}
+
+// Returns a Set of issue keys that lie on the critical path (zero total float)
+export function findCriticalPath(plan, roughMap) {
+  if (!plan?.issues) return new Set();
+  const issues = plan.issues;
+
+  // Build forward end dates for each issue
+  const endDates = {};
+  for (const [k, e] of Object.entries(issues)) {
+    if (!e.startDate) continue;
+    const devs = (e.assignedPlaceholders || []).length || 1;
+    endDates[k] = calcEndDate(e.startDate, roughMap[k], devs) || e.startDate;
+  }
+
+  // Project end = max end date across all issues
+  const projectEnd = Object.values(endDates).reduce((max, d) => (!max || d > max ? d : max), null);
+  if (!projectEnd) return new Set();
+
+  // Late finish = project end for all issues (simple critical path without slack)
+  // A critical path issue: its end date equals the latest possible end date in its chain
+  const criticalKeys = new Set();
+
+  // Walk backwards: an issue is critical if removing it would delay the project
+  // Simplified: an issue is critical if endDates[k] === projectEnd OR
+  // any issue that depends on it (directly or transitively) is critical and
+  // the dependency is the binding one.
+  const dependents = {};
+  for (const [k, e] of Object.entries(issues)) {
+    for (const dep of (e.dependencies || [])) {
+      if (!dependents[dep]) dependents[dep] = [];
+      dependents[dep].push(k);
+    }
+  }
+
+  // Find all issues whose end date equals projectEnd — these are the final nodes
+  for (const [k, end] of Object.entries(endDates)) {
+    if (end === projectEnd) criticalKeys.add(k);
+  }
+
+  // Walk backwards through dependencies from critical nodes
+  const toVisit = [...criticalKeys];
+  while (toVisit.length) {
+    const k = toVisit.pop();
+    const e = issues[k];
+    for (const depKey of (e?.dependencies || [])) {
+      if (!criticalKeys.has(depKey) && endDates[depKey]) {
+        // Check if this dep is the binding predecessor
+        const depEnd = endDates[depKey];
+        const myStart = issues[k]?.startDate;
+        if (myStart && depEnd && nextWorkDay(depEnd) === myStart) {
+          criticalKeys.add(depKey);
+          toVisit.push(depKey);
+        }
+      }
+    }
+  }
+
+  return criticalKeys;
+}

@@ -1,0 +1,24 @@
+modules:
+  jira:globalPage:
+    - key: plan-jira-page
+      title: planJira
+      layout: basic
+      resource: main
+
+resources:
+  - key: main
+    path: static/app/build
+    tunnel:
+      port: 3000
+
+app:
+  id: ari:cloud:ecosystem::app/dfccc25b-0e9b-467e-a703-9a0e66cfae4f
+  runtime:
+    name: nodejs22.x
+
+permissions:
+  scopes:
+    - manage:jira-project
+    - read:jira-user
+    - read:jira-work
+    - write:jira-work
