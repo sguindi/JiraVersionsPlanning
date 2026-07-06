@@ -359,6 +359,7 @@ function Chip({ label, color, onRemove, onClick, selected }) {
 // ── Delivery Report ───────────────────────────────────────────────────────────
 function DeliveryReport({ computedPlan, roughMap, planName, mode, codeFreezeDate, finalDeliveryDate }) {
   var [open, setOpen] = React.useState(true);
+  var [copied, setCopied] = React.useState(false);
   var span = computeProjectSpan(computedPlan, roughMap);
   var critPath = computeCriticalPath(computedPlan, roughMap);
   var devUtils = computeDevUtilization(computedPlan, roughMap);
@@ -371,20 +372,65 @@ function DeliveryReport({ computedPlan, roughMap, planName, mode, codeFreezeDate
   var accentLight = mode === 'final' ? '#E9F2FF' : '#EAE6FF';
   var deliveryLabel = mode === 'final' ? 'Committed Delivery' : 'Draft Delivery';
 
+  function buildReportText() {
+    var lines = [];
+    lines.push('# ' + (mode === 'final' ? 'Final Delivery Report' : 'Draft Delivery Estimate') + (planName ? ': ' + planName : ''));
+    lines.push('');
+    lines.push('| | |');
+    lines.push('|---|---|');
+    lines.push('| Start | ' + (span.start || '—') + ' |');
+    lines.push('| Dev Complete | ' + (span.end || '—') + ' |');
+    if (codeFreezeDate) lines.push('| Code Freeze | ' + codeFreezeDate + ' |');
+    if (finalDeliveryDate) lines.push('| Final Delivery | ' + finalDeliveryDate + ' |');
+    lines.push('| Duration | ' + totalDays + ' working days |');
+    if (milestones.length > 0) {
+      lines.push(''); lines.push('## Milestones');
+      milestones.forEach(function(m) { lines.push('- **' + m.label + '** — ' + m.date); });
+    }
+    if (critPath.length > 0) {
+      lines.push(''); lines.push('## Critical Path');
+      lines.push(critPath.map(function(k) { var d = calcDays(roughMap[k], 1); return k + ' (' + d + 'd)'; }).join(' → '));
+    }
+    if (placeholders.length > 0) {
+      lines.push(''); lines.push('## Team');
+      var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY : 1;
+      placeholders.forEach(function(ph) {
+        var h = devUtils[ph.id] || 0;
+        var pct = Math.round(h / cap * 100);
+        lines.push('- **' + ph.name + '**: ' + h.toFixed(0) + 'h / ' + cap.toFixed(0) + 'h (' + pct + '%)');
+      });
+    }
+    return lines.join('\n');
+  }
+
+  function handleCopy() {
+    try {
+      navigator.clipboard.writeText(buildReportText());
+      setCopied(true);
+      setTimeout(function() { setCopied(false); }, 2000);
+    } catch (e) { /* clipboard unavailable */ }
+  }
+
   return (
     <div style={{ background: open ? accentLight : '#F4F5F7', borderTop: '2px solid ' + accentColor, flexShrink: 0 }}>
-      <button onClick={function() { setOpen(function(o) { return !o; }); }}
-        style={{ width: '100%', textAlign: 'left', padding: '8px 16px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
-        <span style={{ fontSize: 10, color: accentColor }}>{open ? '▼' : '▶'}</span>
-        <span style={{ fontWeight: 800, color: accentColor, fontSize: 13 }}>
-          {mode === 'final' ? '📋 Final Delivery Report' : '📋 Draft Delivery Estimate'}
-        </span>
-        <span style={{ background: accentColor, color: '#fff', borderRadius: 12, padding: '2px 10px', fontSize: 12, fontWeight: 700 }}>
-          🚀 {span.end}
-        </span>
-        {planName && <span style={{ color: '#5E6C84', fontSize: 11 }}>— {planName}</span>}
-        {totalDays > 0 && <span style={{ color: '#5E6C84', fontSize: 11 }}>· {totalDays} working days</span>}
-      </button>
+      <div style={{ display: 'flex', alignItems: 'center' }}>
+        <button onClick={function() { setOpen(function(o) { return !o; }); }}
+          style={{ flex: 1, textAlign: 'left', padding: '8px 16px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
+          <span style={{ fontSize: 10, color: accentColor }}>{open ? '▼' : '▶'}</span>
+          <span style={{ fontWeight: 800, color: accentColor, fontSize: 13 }}>
+            {mode === 'final' ? '📋 Final Delivery Report' : '📋 Draft Delivery Estimate'}
+          </span>
+          <span style={{ background: accentColor, color: '#fff', borderRadius: 12, padding: '2px 10px', fontSize: 12, fontWeight: 700 }}>
+            🚀 {span.end}
+          </span>
+          {planName && <span style={{ color: '#5E6C84', fontSize: 11 }}>— {planName}</span>}
+          {totalDays > 0 && <span style={{ color: '#5E6C84', fontSize: 11 }}>· {totalDays} working days</span>}
+        </button>
+        <button onClick={handleCopy} title="Copy report as Markdown"
+          style={{ margin: '0 12px', padding: '4px 12px', background: copied ? '#36B37E' : '#fff', color: copied ? '#fff' : accentColor, border: '1px solid ' + accentColor, borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: 'pointer', flexShrink: 0, transition: 'background 0.2s, color 0.2s' }}>
+          {copied ? '✓ Copied' : '⎘ Copy'}
+        </button>
+      </div>
 
       {open && (
         <div style={{ padding: '0 16px 16px', fontSize: 12 }}>
@@ -1326,7 +1372,15 @@ export default function VersionPlanningView({ projectKeys }) {
                       const sb = getEpicSummaryBarProps(row.key, storiesByEpic, computedPlan, roughMap, workingDays);
                       if (!sb) return null;
                       const barColor = phs.length === 1 ? phs[0].color : '#6554C0';
+                      const _fStories = (storiesByEpic[row.key] || []).filter(s => computedPlan.issues?.[s.key]?.startDate);
+                      const _fTotalHours = _fStories.reduce((s, st) => s + (roughMap[st.key] || 0), 0);
+                      const _fAvgDevs = _fStories.length > 0
+                        ? Math.max(1, Math.round(_fStories.reduce((s, st) => s + ((computedPlan.issues?.[st.key]?.assignedPlaceholders || []).length || 1), 0) / _fStories.length))
+                        : 1;
+                      const { qaDays: _fqd, bugFixDays: _fbfd } = calcQaBugFixDays(_fTotalHours, _fAvgDevs, qaMap[row.key] || 0, bugFixPct);
+                      const _fQaLeft = sb.left + sb.width + 2;
                       return (
+                        <>
                         <div style={{
                           position: 'absolute',
                           left: sb.left, top: isExpanded ? 4 : 5,
@@ -1342,6 +1396,25 @@ export default function VersionPlanningView({ projectKeys }) {
                         }} title={`${sb.placedStories}/${sb.totalStories} stories placed`}>
                           {!isExpanded && `${sb.placedStories}/${sb.totalStories} stories`}
                         </div>
+                        {!isExpanded && _fqd > 0 && (
+                          <div style={{
+                            position: 'absolute',
+                            left: _fQaLeft, top: 5, width: _fqd * DAY_WIDTH - 2, height: ROW_HEIGHT - 10,
+                            background: '#FFAB00', borderRadius: 4, opacity: 0.85,
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            fontSize: 9, color: '#fff', fontWeight: 700, pointerEvents: 'none',
+                          }} title={`QA testing: ${_fqd}d`}>QA {_fqd}d</div>
+                        )}
+                        {!isExpanded && _fbfd > 0 && (
+                          <div style={{
+                            position: 'absolute',
+                            left: _fQaLeft + _fqd * DAY_WIDTH, top: 5, width: _fbfd * DAY_WIDTH - 2, height: ROW_HEIGHT - 10,
+                            background: '#FF7452', borderRadius: 4, opacity: 0.85,
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            fontSize: 9, color: '#fff', fontWeight: 700, pointerEvents: 'none',
+                          }} title={`Bug fix time: ${_fbfd}d`}>Fix {_fbfd}d</div>
+                        )}
+                        </>
                       );
                     })() : bar && (
                       <div
@@ -1485,7 +1558,14 @@ export default function VersionPlanningView({ projectKeys }) {
                     const sourceBar = getBarProps(depKey);
                     const targetBar = getBarProps(row.key);
                     if (depRowIdx < 0 || !sourceBar || !targetBar) return null;
-                    const sx = sourceBar.left + sourceBar.width;
+                    // In draft mode, arrow leaves from end of QA+bugfix bar, not just dev bar
+                    let arrowSrcX = sourceBar.left + sourceBar.width;
+                    if (planningMode === 'draft') {
+                      const _sDevs = (computedPlan.issues?.[depKey]?.assignedPlaceholders || []).length || 1;
+                      const { qaDays: _sqd, bugFixDays: _sbfd } = calcQaBugFixDays(roughMap[depKey], _sDevs, qaMap[depKey] || 0, bugFixPct);
+                      arrowSrcX = sourceBar.left + (sourceBar.durationDays + _sqd + _sbfd) * DAY_WIDTH;
+                    }
+                    const sx = arrowSrcX;
                     const sy = HEADER_H + depRowIdx * ROW_HEIGHT + ROW_HEIGHT / 2;
                     const tx = targetBar.left;
                     const ty = HEADER_H + rowIdx * ROW_HEIGHT + ROW_HEIGHT / 2;
