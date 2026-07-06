@@ -24,6 +24,17 @@ export function calcEndDate(startStr, roughHours, devCount) {
   return extra === 0 ? startStr : addWorkingDays(startStr, extra);
 }
 
+// Returns the QA days, bug-fix days, and their sum for a given epic.
+// qaHours: hours the QA team needs (not divided by devCount — QA is a separate team)
+// bugFixPct: percentage of dev time that developers spend fixing bugs after QA
+export function calcQaBugFixDays(roughHours, devCount, qaHours, bugFixPct) {
+  const devs = devCount || 1;
+  const qaDays = qaHours ? Math.ceil(qaHours / HOURS_PER_DAY) : 0;
+  const bugFixHours = roughHours && bugFixPct ? roughHours * bugFixPct / 100 : 0;
+  const bugFixDays = bugFixHours ? calcDays(bugFixHours, devs) : 0;
+  return { qaDays, bugFixDays, totalExtra: qaDays + bugFixDays };
+}
+
 export function buildWorkingDays(fromStr, count) {
   const days = [];
   let cur = parseISO(fromStr);
@@ -34,8 +45,11 @@ export function buildWorkingDays(fromStr, count) {
   return days;
 }
 
-export function cascadePlan(plan, roughMap) {
+// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number }
+export function cascadePlan(plan, roughMap, opts = {}) {
   if (!plan?.issues) return plan;
+  const qaMap = opts.qaMap || {};
+  const bugFixPct = opts.bugFixPct || 0;
   const issues = { ...plan.issues };
   const dependents = {};
   for (const [key, e] of Object.entries(issues)) {
@@ -62,22 +76,30 @@ export function cascadePlan(plan, roughMap) {
       const de = newIssues[depKey];
       if (!de?.startDate) continue;
       const devs = (de.assignedPlaceholders || []).length || 1;
-      const end = calcEndDate(de.startDate, roughMap[depKey], devs);
-      if (end && (!latestEnd || end > latestEnd)) latestEnd = end;
+      const devEnd = calcEndDate(de.startDate, roughMap[depKey], devs);
+      if (!devEnd) continue;
+      const { totalExtra } = calcQaBugFixDays(roughMap[depKey], devs, qaMap[depKey] || 0, bugFixPct);
+      const end = totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd;
+      if (!latestEnd || end > latestEnd) latestEnd = end;
     }
     if (latestEnd) newIssues[k] = { ...e, startDate: nextWorkDay(latestEnd) };
   }
   return { ...plan, issues: newIssues };
 }
 
-export function detectConflicts(plan, roughMap) {
+// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number }
+export function detectConflicts(plan, roughMap, opts = {}) {
+  const qaMap = opts.qaMap || {};
+  const bugFixPct = opts.bugFixPct || 0;
   const result = [];
   for (const ph of (plan.placeholders || [])) {
     const assigned = Object.entries(plan.issues || {})
       .filter(([, e]) => e.assignedPlaceholders?.includes(ph.id) && e.startDate)
       .map(([key, e]) => {
         const devs = (e.assignedPlaceholders || []).length || 1;
-        return { key, startDate: e.startDate, endDate: calcEndDate(e.startDate, roughMap[key], devs) || e.startDate };
+        const devEnd = calcEndDate(e.startDate, roughMap[key], devs) || e.startDate;
+        const { totalExtra } = calcQaBugFixDays(roughMap[key], devs, qaMap[key] || 0, bugFixPct);
+        return { key, startDate: e.startDate, endDate: totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd };
       })
       .sort((a, b) => a.startDate.localeCompare(b.startDate));
     for (let i = 0; i < assigned.length - 1; i++) {
