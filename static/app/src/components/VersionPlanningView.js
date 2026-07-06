@@ -1514,6 +1514,7 @@ export default function VersionPlanningView({ projectKeys }) {
                 {planningMode === 'draft' && codeFreezeDate && (() => {
                   const cfIdx = workingDays.indexOf(codeFreezeDate);
                   const seIdx = stabilizationEndDate ? workingDays.indexOf(stabilizationEndDate) : -1;
+                  if (stabilizationEndDate && seIdx < 0) console.warn('[planJira] stabilizationEndDate', stabilizationEndDate, 'outside workingDays — delivery line hidden');
                   const svgH = HEADER_H + rows.length * ROW_HEIGHT;
                   return (
                     <>
@@ -1563,7 +1564,7 @@ export default function VersionPlanningView({ projectKeys }) {
                     if (planningMode === 'draft') {
                       const _sDevs = (computedPlan.issues?.[depKey]?.assignedPlaceholders || []).length || 1;
                       const { qaDays: _sqd, bugFixDays: _sbfd } = calcQaBugFixDays(roughMap[depKey], _sDevs, qaMap[depKey] || 0, bugFixPct);
-                      arrowSrcX = sourceBar.left + (sourceBar.durationDays + _sqd + _sbfd) * DAY_WIDTH;
+                      arrowSrcX = sourceBar.left + (sourceBar.durationDays + _sqd + _sbfd) * DAY_WIDTH - 2;
                     }
                     const sx = arrowSrcX;
                     const sy = HEADER_H + depRowIdx * ROW_HEIGHT + ROW_HEIGHT / 2;
