@@ -13,6 +13,12 @@ export function addWorkingDays(startStr, n) {
 
 export function nextWorkDay(dateStr) { return addWorkingDays(dateStr, 1); }
 
+// Returns dateStr unchanged if it's already a working day, otherwise forward-skips to the next one.
+export function snapToWorkingDay(dateStr) {
+  if (!dateStr) return dateStr;
+  return isWeekend(parseISO(dateStr)) ? nextWorkDay(dateStr) : dateStr;
+}
+
 export function calcDays(roughHours, devCount) {
   if (!roughHours || !devCount) return 1;
   return Math.max(1, Math.ceil(roughHours / (devCount * HOURS_PER_DAY)));
@@ -45,11 +51,15 @@ export function buildWorkingDays(fromStr, count) {
   return days;
 }
 
-// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number }
+// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number, bufferDays: number }
+// bufferDays — extra working days inserted after a dependency ends before its dependent
+// can start (on top of the normal next-working-day gap) — an Epic Timeline mode setting,
+// analogous to Draft mode's QA/bug-fix/code-freeze buffers.
 export function cascadePlan(plan, roughMap, opts = {}) {
   if (!plan?.issues) return plan;
   const qaMap = opts.qaMap || {};
   const bugFixPct = opts.bugFixPct || 0;
+  const bufferDays = opts.bufferDays || 0;
   const issues = { ...plan.issues };
   const dependents = {};
   for (const [key, e] of Object.entries(issues)) {
@@ -76,34 +86,46 @@ export function cascadePlan(plan, roughMap, opts = {}) {
       const de = newIssues[depKey];
       if (!de?.startDate) continue;
       const devs = (de.assignedPlaceholders || []).length || 1;
-      const devEnd = calcEndDate(de.startDate, roughMap[depKey], devs);
+      // A locked issue's real end date is a fact — never replace it with an estimate.
+      const devEnd = de.actualEndDate || calcEndDate(de.startDate, roughMap[depKey], devs);
       if (!devEnd) continue;
       const { totalExtra } = calcQaBugFixDays(roughMap[depKey], devs, qaMap[depKey] || 0, bugFixPct);
       const end = totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd;
       if (!latestEnd || end > latestEnd) latestEnd = end;
     }
-    if (latestEnd) newIssues[k] = { ...e, startDate: nextWorkDay(latestEnd) };
+    if (latestEnd) newIssues[k] = { ...e, startDate: addWorkingDays(latestEnd, 1 + bufferDays) };
   }
   return { ...plan, issues: newIssues };
 }
 
-// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number }
+// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number, excludeKeys: Iterable<string>,
+//         skipLockedPairs: boolean }
+// excludeKeys — issue keys to leave out entirely (e.g. a container story in Epic Timeline
+// mode, whose own stored dates are vestigial and always "overlap" its own children by
+// definition — that's not a real scheduling conflict).
+// skipLockedPairs — when true, a conflict between two issues that BOTH have a real,
+// immutable `actualEndDate` (Jira status history) is not reported, since nothing about
+// scheduling can resolve two facts that already overlapped in reality.
 export function detectConflicts(plan, roughMap, opts = {}) {
   const qaMap = opts.qaMap || {};
   const bugFixPct = opts.bugFixPct || 0;
+  const excludeKeys = opts.excludeKeys ? new Set(opts.excludeKeys) : null;
   const result = [];
   for (const ph of (plan.placeholders || [])) {
     const assigned = Object.entries(plan.issues || {})
-      .filter(([, e]) => e.assignedPlaceholders?.includes(ph.id) && e.startDate)
+      .filter(([key, e]) => e.assignedPlaceholders?.includes(ph.id) && e.startDate && !(excludeKeys && excludeKeys.has(key)))
       .map(([key, e]) => {
         const devs = (e.assignedPlaceholders || []).length || 1;
-        const devEnd = calcEndDate(e.startDate, roughMap[key], devs) || e.startDate;
+        // A locked issue's real end date is a fact — never replace it with an estimate.
+        const devEnd = e.actualEndDate || calcEndDate(e.startDate, roughMap[key], devs) || e.startDate;
         const { totalExtra } = calcQaBugFixDays(roughMap[key], devs, qaMap[key] || 0, bugFixPct);
-        return { key, startDate: e.startDate, endDate: totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd };
+        const endDate = (!e.actualEndDate && totalExtra > 0) ? addWorkingDays(devEnd, totalExtra) : devEnd;
+        return { key, startDate: e.startDate, endDate, isLocked: !!e.actualEndDate };
       })
       .sort((a, b) => a.startDate.localeCompare(b.startDate));
     for (let i = 0; i < assigned.length - 1; i++) {
       if (assigned[i].endDate >= assigned[i + 1].startDate) {
+        if (opts.skipLockedPairs && assigned[i].isLocked && assigned[i + 1].isLocked) continue;
         result.push({ placeholder: ph, source: assigned[i].key, target: assigned[i + 1].key });
       }
     }

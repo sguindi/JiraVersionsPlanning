@@ -250,8 +250,8 @@ export default function EpicHierarchyPanel({
           <select value={selectedVersionId || ''} onChange={e => onVersionChange(e.target.value || null)}
             style={{ width: '100%', padding: '5px 8px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, background: '#fff', color: '#172B4D' }}>
             <option value="">All versions</option>
-            {(epicData.versions || []).map(v => (
-              <option key={v.id} value={v.id}>{v.projectKey} — {v.name}{v.released ? ' ✓' : ''}</option>
+            {(epicData.versions || []).filter(v => !v.released && !v.archived).map(v => (
+              <option key={v.id} value={v.id}>{v.projectKey} — {v.name}</option>
             ))}
           </select>
         )}

@@ -49,10 +49,10 @@ class ErrorBoundary extends React.Component {
 }
 
 const TABS = [
-  { id: 'calendar', label: 'Calendar' },
   { id: 'version', label: 'Version Planning' },
-  { id: 'timeline', label: 'Timeline' },
-  { id: 'team', label: 'Team' },
+  { id: 'calendar', label: 'Calendar', disabled: true },
+  { id: 'timeline', label: 'Timeline', disabled: true },
+  { id: 'team', label: 'Team', disabled: true },
 ];
 
 function App() {
@@ -61,7 +61,7 @@ function App() {
   const [projectsError, setProjectsError] = useState(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const [activeTab, setActiveTab] = useState('calendar');
+  const [activeTab, setActiveTab] = useState('version');
   const [currentDate, setCurrentDate] = useState(new Date());
   const [viewMode, setViewMode] = useState('month');
   const [showSearch, setShowSearch] = useState(false);
@@ -298,13 +298,16 @@ function App() {
           <button
             key={tab.id}
             data-tutorial={`tab-${tab.id}`}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => { if (!tab.disabled) setActiveTab(tab.id); }}
+            disabled={tab.disabled}
+            title={tab.disabled ? 'Coming soon' : undefined}
             style={{
               padding: '7px 20px', borderRadius: 6,
-              border: activeTab === tab.id ? '2px solid #0052CC' : '2px solid #DFE1E6',
-              background: activeTab === tab.id ? '#0052CC' : '#fff',
-              color: activeTab === tab.id ? '#fff' : '#42526E',
-              fontSize: 13, fontWeight: 600, cursor: 'pointer',
+              border: tab.disabled ? '2px solid #EBECF0' : activeTab === tab.id ? '2px solid #0052CC' : '2px solid #DFE1E6',
+              background: tab.disabled ? '#F4F5F7' : activeTab === tab.id ? '#0052CC' : '#fff',
+              color: tab.disabled ? '#A5ADBA' : activeTab === tab.id ? '#fff' : '#42526E',
+              fontSize: 13, fontWeight: 600,
+              cursor: tab.disabled ? 'not-allowed' : 'pointer',
             }}
           >
             {tab.label}

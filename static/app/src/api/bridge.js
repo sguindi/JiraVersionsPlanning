@@ -151,9 +151,26 @@ export async function getStoriesForEpics(epicKeys) {
 
 export async function getSubtasksForStories(storyKeys) {
   if (!storyKeys.length) return [];
+  const ref = await resolveRoughEstField();
   const keys = storyKeys.join(', ');
   const jql = `parent in (${keys}) AND issuetype in subTaskIssueTypes() ORDER BY created ASC`;
-  return searchAll(jql, BASE_FIELDS);
+  const fields = [...BASE_FIELDS];
+  if (ref) fields.push(ref);
+  return searchAll(jql, fields);
+}
+
+// ── Issue changelog (status transition history) ──────────────────────────────
+
+export async function getIssueChangelog(issueKey) {
+  const all = [];
+  let startAt = 0;
+  while (true) {
+    const page = await jiraGet(`/rest/api/3/issue/${issueKey}/changelog?startAt=${startAt}&maxResults=100`);
+    all.push(...(page.values || []));
+    if (page.isLast || !page.values?.length) break;
+    startAt += page.values.length;
+  }
+  return all;
 }
 
 export async function getVersionsForProjects(projectKeys) {
@@ -161,7 +178,7 @@ export async function getVersionsForProjects(projectKeys) {
   await Promise.all(projectKeys.map(async (key) => {
     try {
       const versions = await jiraGet(`/rest/api/3/project/${key}/versions`);
-      all.push(...versions.map(v => ({ id: v.id, name: v.name, projectKey: key, released: v.released || false })));
+      all.push(...versions.map(v => ({ id: v.id, name: v.name, projectKey: key, released: v.released || false, archived: v.archived || false })));
     } catch (e) {
       // project may not have versions
     }

@@ -4,10 +4,21 @@ import {
   getVersionPlanData, saveVersionPlanData, deleteVersionPlanData,
 } from '../api/bridge';
 
+// Maximally distinct hues — deliberately only ONE orange (#EA580C) so two devs never
+// render as visually-indistinguishable shades of the same color.
 const PLACEHOLDER_COLORS = [
-  '#0052CC', '#00875A', '#FF5630', '#FF991F',
-  '#6554C0', '#00B8D9', '#E91E63', '#795548',
-  '#2196F3', '#4CAF50',
+  '#2563EB', // blue
+  '#16A34A', // green
+  '#DC2626', // red
+  '#9333EA', // purple
+  '#0891B2', // cyan
+  '#EA580C', // orange
+  '#DB2777', // pink
+  '#78350F', // brown
+  '#4338CA', // indigo
+  '#65A30D', // olive
+  '#0D9488', // teal
+  '#64748B', // slate
 ];
 
 function emptyPlan() {
@@ -81,6 +92,23 @@ export function useVersionPlan(projectKey, versionId, planId) {
     });
   }, [updatePlan]);
 
+  // Deterministic id from the Jira accountId means the caller can use the returned
+  // id immediately (e.g. to assign it to an issue) without waiting for this state
+  // update to land — no placeholder is created if one for this assignee already exists.
+  const ensurePlaceholderForAssignee = useCallback((accountId, displayName) => {
+    if (!accountId) return null;
+    const id = 'acc_' + accountId;
+    updatePlan(prev => {
+      if (prev.placeholders.some(p => p.id === id)) return prev;
+      const color = PLACEHOLDER_COLORS[prev.placeholders.length % PLACEHOLDER_COLORS.length];
+      return {
+        ...prev,
+        placeholders: [...prev.placeholders, { id, name: displayName || 'Unassigned', color, accountId }],
+      };
+    });
+    return id;
+  }, [updatePlan]);
+
   const removePlaceholder = useCallback((phId) => {
     updatePlan(prev => ({
       ...prev,
@@ -98,6 +126,16 @@ export function useVersionPlan(projectKey, versionId, planId) {
     updatePlan(prev => ({
       ...prev,
       placeholders: prev.placeholders.map(p => p.id === phId ? { ...p, name: newName } : p),
+    }));
+  }, [updatePlan]);
+
+  // Reassigns every existing placeholder's color from the current PLACEHOLDER_COLORS
+  // palette, in order — for plans created before a palette update, so devs that ended up
+  // with two similar-looking colors (e.g. two oranges) can be fixed without recreating them.
+  const recolorPlaceholders = useCallback(() => {
+    updatePlan(prev => ({
+      ...prev,
+      placeholders: prev.placeholders.map((p, i) => ({ ...p, color: PLACEHOLDER_COLORS[i % PLACEHOLDER_COLORS.length] })),
     }));
   }, [updatePlan]);
 
@@ -164,7 +202,7 @@ export function useVersionPlan(projectKey, versionId, planId) {
     plan, loading, saving, saveError,
     planIndex, indexLoading,
     updatePlan, updateIssueEntry,
-    addPlaceholder, removePlaceholder, renamePlaceholder,
+    addPlaceholder, removePlaceholder, renamePlaceholder, recolorPlaceholders, ensurePlaceholderForAssignee,
     addMilestone, removeMilestone,
     clearPlan, savePlanToStorage,
     createPlan, renamePlanInIndex, deletePlanFromIndex,
