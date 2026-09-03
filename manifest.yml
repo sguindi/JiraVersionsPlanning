@@ -4,22 +4,17 @@ modules:
       title: K1-Planner
       layout: basic
       resource: main
-      # icon isn't supported on the top-level jira:globalPage module at all (confirmed against
-      # Atlassian's manifest reference) — it only exists on `pages` sub-entries. A single-entry
-      # pages array is otherwise a no-op (same one destination, same resource) purely to unlock
-      # the icon field via Forge's bundled-resource syntax (resource:<key>;<path>).
-      pages:
-        - title: K1-Planner
-          route: app
-          icon: resource:icon;icon.svg
+      # Tried a single-entry `pages` array with a bundled-resource icon (resource:<key>;<path>)
+      # to work around the top-level module having no icon field at all — it registered a
+      # redundant sub-menu item ("K1-Planner" nested under "K1-Planner") without ever actually
+      # showing the icon (still fell back to the default). Reverted; there is currently no
+      # working way to set a custom nav icon for a single-page jira:globalPage app.
 
 resources:
   - key: main
     path: static/app/build
     tunnel:
       port: 3000
-  - key: icon
-    path: static/app/public
 
 app:
   id: ari:cloud:ecosystem::app/dfccc25b-0e9b-467e-a703-9a0e66cfae4f
