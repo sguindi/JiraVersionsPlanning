@@ -151,10 +151,13 @@ export async function getStoriesForEpics(epicKeys) {
 
 export async function getSubtasksForStories(storyKeys) {
   if (!storyKeys.length) return [];
+  const sdf = await resolveStartDateField();
   const ref = await resolveRoughEstField();
   const keys = storyKeys.join(', ');
   const jql = `parent in (${keys}) AND issuetype in subTaskIssueTypes() ORDER BY created ASC`;
-  const fields = [...BASE_FIELDS];
+  // Start date (custom field) + duedate (in BASE_FIELDS) let the planner honor dates already
+  // committed in Jira — epics/stories already requested `sdf`, subtasks were missing it.
+  const fields = [...BASE_FIELDS, sdf];
   if (ref) fields.push(ref);
   return searchAll(jql, fields);
 }
@@ -191,26 +194,41 @@ export async function getBoardsForProject(projectKey) {
     const page = await jiraGet(`/rest/agile/1.0/board?projectKeyOrId=${projectKey}&maxResults=10`);
     return (page.values || []).map(b => ({ id: b.id, name: b.name }));
   } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[planJira] getBoardsForProject failed for', projectKey, '—', e?.message || e);
     return [];
   }
 }
 
+// No `state` filter — a real project's sprints are mostly CLOSED (historical); filtering to
+// active,future silently excluded almost everything a "many sprints already defined" project
+// actually has. Fetching all of them is safe: the Gantt only ever renders the ones whose dates
+// fall inside the currently-visible workingDays window, so a closed sprint from years ago
+// costs nothing extra to have fetched if it's simply off-screen.
 export async function getSprintsForBoard(boardId) {
-  const sprints = [];
-  let startAt = 0;
-  while (true) {
-    const page = await jiraGet(
-      `/rest/agile/1.0/board/${boardId}/sprint?state=active,future&maxResults=50&startAt=${startAt}`
-    );
-    sprints.push(...(page.values || []));
-    if (page.isLast) break;
-    if (!page.values?.length) break;
-    startAt += page.values.length;
+  try {
+    const sprints = [];
+    let startAt = 0;
+    while (true) {
+      const page = await jiraGet(
+        `/rest/agile/1.0/board/${boardId}/sprint?maxResults=50&startAt=${startAt}`
+      );
+      sprints.push(...(page.values || []));
+      if (page.isLast) break;
+      if (!page.values?.length) break;
+      startAt += page.values.length;
+    }
+    return sprints.map(s => ({
+      id: String(s.id), name: s.name, state: s.state,
+      startDate: s.startDate || null, endDate: s.endDate || null, boardId,
+    }));
+  } catch (e) {
+    // A board with no sprint capability (e.g. a plain kanban board) 404s here — don't let
+    // one bad board in Promise.all wipe out every OTHER board's sprints for the whole project.
+    // eslint-disable-next-line no-console
+    console.warn('[planJira] getSprintsForBoard failed for board', boardId, '—', e?.message || e);
+    return [];
   }
-  return sprints.map(s => ({
-    id: String(s.id), name: s.name, state: s.state,
-    startDate: s.startDate || null, endDate: s.endDate || null, boardId,
-  }));
 }
 
 // ── Team workload ─────────────────────────────────────────────────────────────

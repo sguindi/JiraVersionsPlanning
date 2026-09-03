@@ -13,6 +13,16 @@ export function addWorkingDays(startStr, n) {
 
 export function nextWorkDay(dateStr) { return addWorkingDays(dateStr, 1); }
 
+// Counts BACKWARD n working days. Needed to derive a start date from a committed due date:
+// an issue that only has a due date in Jira should finish on that date, so its start is the
+// due date minus its estimated duration.
+export function subWorkingDays(startStr, n) {
+  let cur = parseISO(startStr);
+  let cnt = 0;
+  while (cnt < n) { cur = addDays(cur, -1); if (!isWeekend(cur)) cnt++; }
+  return format(cur, 'yyyy-MM-dd');
+}
+
 // Returns dateStr unchanged if it's already a working day, otherwise forward-skips to the next one.
 export function snapToWorkingDay(dateStr) {
   if (!dateStr) return dateStr;
@@ -22,6 +32,24 @@ export function snapToWorkingDay(dateStr) {
 export function calcDays(roughHours, devCount) {
   if (!roughHours || !devCount) return 1;
   return Math.max(1, Math.ceil(roughHours / (devCount * HOURS_PER_DAY)));
+}
+
+// A developer working less than full-time on this plan (capacityPct < 100) contributes
+// proportionally less than a full "1 dev" toward an issue's daily throughput — e.g. two
+// devs at 100% + 80% capacity count as 1.8 effective devs, not 2. `devCount` everywhere
+// in this file is really "effective dev count" and can be fractional; calcDays/calcEndDate
+// need no changes since dividing by a fractional devCount already does the right thing.
+// placeholders without a capacityPct (older data) default to 100%.
+export function effectiveDevCount(assignedIds, placeholders) {
+  if (!assignedIds || !assignedIds.length) return 1;
+  const byId = {};
+  (placeholders || []).forEach(p => { byId[p.id] = p; });
+  const sum = assignedIds.reduce((s, id) => {
+    const ph = byId[id];
+    const pct = ph && typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+    return s + (pct / 100);
+  }, 0);
+  return sum || 1;
 }
 
 export function calcEndDate(startStr, roughHours, devCount) {
@@ -51,15 +79,21 @@ export function buildWorkingDays(fromStr, count) {
   return days;
 }
 
-// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number, bufferDays: number }
+// opts: { qaMap: { [issueKey]: qaHours }, bugFixPct: number, bufferDays: number,
+//         bugFixBaseMap: { [issueKey]: hours } }
 // bufferDays — extra working days inserted after a dependency ends before its dependent
 // can start (on top of the normal next-working-day gap) — an Epic Timeline mode setting,
 // analogous to Draft mode's QA/bug-fix/code-freeze buffers.
+// bugFixBaseMap — hours to size the QA/bug-fix buffer against, when that differs from the
+// hours used for the dev duration (`roughMap`). Draft mode passes an epic's not-yet-DONE
+// hours here while roughMap holds only its not-yet-DEV-DONE hours: work awaiting QA sign-off
+// has no dev time left but still needs rework budget. Falls back to roughMap when absent.
 export function cascadePlan(plan, roughMap, opts = {}) {
   if (!plan?.issues) return plan;
   const qaMap = opts.qaMap || {};
   const bugFixPct = opts.bugFixPct || 0;
   const bufferDays = opts.bufferDays || 0;
+  const bugFixBase = opts.bugFixBaseMap || roughMap;
   const issues = { ...plan.issues };
   const dependents = {};
   for (const [key, e] of Object.entries(issues)) {
@@ -85,11 +119,11 @@ export function cascadePlan(plan, roughMap, opts = {}) {
     for (const depKey of e.dependencies) {
       const de = newIssues[depKey];
       if (!de?.startDate) continue;
-      const devs = (de.assignedPlaceholders || []).length || 1;
+      const devs = effectiveDevCount(de.assignedPlaceholders, plan.placeholders);
       // A locked issue's real end date is a fact — never replace it with an estimate.
       const devEnd = de.actualEndDate || calcEndDate(de.startDate, roughMap[depKey], devs);
       if (!devEnd) continue;
-      const { totalExtra } = calcQaBugFixDays(roughMap[depKey], devs, qaMap[depKey] || 0, bugFixPct);
+      const { totalExtra } = calcQaBugFixDays(bugFixBase[depKey], devs, qaMap[depKey] || 0, bugFixPct);
       const end = totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd;
       if (!latestEnd || end > latestEnd) latestEnd = end;
     }
@@ -106,19 +140,22 @@ export function cascadePlan(plan, roughMap, opts = {}) {
 // skipLockedPairs — when true, a conflict between two issues that BOTH have a real,
 // immutable `actualEndDate` (Jira status history) is not reported, since nothing about
 // scheduling can resolve two facts that already overlapped in reality.
+// bugFixBaseMap — see cascadePlan: hours to size the QA/bug-fix buffer against when that
+// differs from the dev-duration hours in roughMap. Falls back to roughMap when absent.
 export function detectConflicts(plan, roughMap, opts = {}) {
   const qaMap = opts.qaMap || {};
   const bugFixPct = opts.bugFixPct || 0;
+  const bugFixBase = opts.bugFixBaseMap || roughMap;
   const excludeKeys = opts.excludeKeys ? new Set(opts.excludeKeys) : null;
   const result = [];
   for (const ph of (plan.placeholders || [])) {
     const assigned = Object.entries(plan.issues || {})
       .filter(([key, e]) => e.assignedPlaceholders?.includes(ph.id) && e.startDate && !(excludeKeys && excludeKeys.has(key)))
       .map(([key, e]) => {
-        const devs = (e.assignedPlaceholders || []).length || 1;
+        const devs = effectiveDevCount(e.assignedPlaceholders, plan.placeholders);
         // A locked issue's real end date is a fact — never replace it with an estimate.
         const devEnd = e.actualEndDate || calcEndDate(e.startDate, roughMap[key], devs) || e.startDate;
-        const { totalExtra } = calcQaBugFixDays(roughMap[key], devs, qaMap[key] || 0, bugFixPct);
+        const { totalExtra } = calcQaBugFixDays(bugFixBase[key], devs, qaMap[key] || 0, bugFixPct);
         const endDate = (!e.actualEndDate && totalExtra > 0) ? addWorkingDays(devEnd, totalExtra) : devEnd;
         return { key, startDate: e.startDate, endDate, isLocked: !!e.actualEndDate };
       })
@@ -142,7 +179,7 @@ export function findCriticalPath(plan, roughMap) {
   const endDates = {};
   for (const [k, e] of Object.entries(issues)) {
     if (!e.startDate) continue;
-    const devs = (e.assignedPlaceholders || []).length || 1;
+    const devs = effectiveDevCount(e.assignedPlaceholders, plan.placeholders);
     endDates[k] = calcEndDate(e.startDate, roughMap[k], devs) || e.startDate;
   }
 

@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { format, parseISO, addDays, getDay, isAfter } from 'date-fns';
 import { useEpicHierarchy } from '../hooks/useEpicHierarchy';
+import { useSprints } from '../hooks/useSprints';
 import { useVersionPlan } from '../hooks/useVersionPlan';
-import { resolveRoughEstField, updateIssueDueDate, updateRoughEstimation, getIssueChangelog } from '../api/bridge';
+import { resolveRoughEstField, resolveStartDateField, updateIssueDueDate, updateRoughEstimation, getIssueChangelog } from '../api/bridge';
 import IssueDetailPane from './IssueDetailPane';
-import { cascadePlan, detectConflicts, calcEndDate, calcDays, nextWorkDay, addWorkingDays, buildWorkingDays, findCriticalPath, calcQaBugFixDays, HOURS_PER_DAY, isWeekend, snapToWorkingDay } from '../utils/planning';
+import { cascadePlan, detectConflicts, calcEndDate, calcDays, nextWorkDay, addWorkingDays, subWorkingDays, buildWorkingDays, findCriticalPath, calcQaBugFixDays, HOURS_PER_DAY, isWeekend, snapToWorkingDay, effectiveDevCount } from '../utils/planning';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BASE_DAY_WIDTH = 50;  // default px per working day — shrunk to fit when the scheduled span is wider than the panel
@@ -25,10 +26,66 @@ const IGNORED_STATUSES = ['knownissue', 'removed'];
 const IN_PROGRESS_STATUS = 'inprogress';
 const IN_REVIEW_STATUS = 'inreview';
 
+// Gantt bar border color by status — lets you tell an issue's real-world state apart from
+// its dev assignment (the bar's fill) at a glance. Statuses not listed here (To Do, In
+// Progress, In Review, …) keep no status border at all, so the bar's own dev-colored
+// border/outline (locked/conflict/critical-path) shows through unobstructed.
+const STATUS_BORDER_COLORS = {
+  done: '#97A0AF',               // grey
+  readyfordeployment: '#0052CC', // blue
+  readyfortest: '#0052CC',       // blue
+  blocked: '#DE350B',            // red
+  monitoring: '#DE350B',         // red
+  validation: '#DE350B',         // red
+};
+function statusBorderColor(statusName) {
+  return STATUS_BORDER_COLORS[normalizeStatusName(statusName)] || null;
+}
+
+// Reserved plan names for "Final" plans — there is exactly one per scope, auto-created
+// on demand, always saved straight to Jira, never shown in the Draft plan picker.
+// Top-level Final mode gets one per version; Epic Timeline's own Final choice gets one
+// per epic (so drilling into one epic's Final schedule doesn't fight with another epic's).
+const FINAL_PLAN_NAME = 'Final';
+function finalPlanName(epicKey) {
+  return epicKey ? `Final — ${epicKey}` : FINAL_PLAN_NAME;
+}
+function isReservedFinalPlanName(name) {
+  return name === FINAL_PLAN_NAME || name.startsWith('Final — ');
+}
+
 // Normalizes a Jira status name for comparison: trims, lowercases, and strips ALL
 // internal whitespace — so "To Do" / "ToDo" / "to  do" are all treated as identical.
 function normalizeStatusName(name) {
   return (name || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+// An issue's committed date window from JIRA'S OWN fields. The DUE DATE is what makes a window
+// exist — it's the commitment. The Start date custom field is used when present; when it isn't,
+// the start is derived by counting `durationDays` working days BACKWARD from the due date, so
+// the work lands finishing exactly on its commitment rather than starting on it.
+// Returns null when there's no due date (nothing committed) — that issue schedules normally.
+function jiraDateWindow(issue, startFieldId, durationDays) {
+  const f = issue?.fields || {};
+  const rawEnd = f.duedate;
+  if (!rawEnd) return null;
+  const end = String(rawEnd).slice(0, 10);
+  const rawStart = startFieldId ? f[startFieldId] : null;
+  if (rawStart) {
+    const start = String(rawStart).slice(0, 10);
+    if (start <= end) return { start, end, derivedStart: false };
+  }
+  const days = Math.max(1, durationDays || 1);
+  return { start: days > 1 ? subWorkingDays(end, days - 1) : end, end, derivedStart: true };
+}
+
+// Two-letter initials for a developer — first letters of the first two words ("Sharon
+// Cohen" → "SC"), or the first two characters of a single-word name ("sharonc" → "SH").
+function devInitials(name) {
+  var parts = (name || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
 function statusInitials(name) {
@@ -52,6 +109,88 @@ function isIgnoredStatus(row) {
   return IGNORED_STATUSES.includes(normalizeStatusName(row.fields?.status?.name));
 }
 
+// "Dev done" — the development work itself is finished, even if QA/deployment isn't.
+// Used to compute an epic's REMAINING DEV estimate: once a child story's dev work is done,
+// its hours no longer count toward how much dev time the epic still needs.
+const DEV_DONE_STATUSES = ['inreview', 'readyfortesting', 'readyfordeployment', 'done'];
+function isDevDoneStatus(row) {
+  return DEV_DONE_STATUSES.includes(normalizeStatusName(row?.fields?.status?.name));
+}
+
+// "Done" — truly finished, QA included. Deliberately narrower than DEV_DONE_STATUSES:
+// dev work sitting in In Review / Ready for Testing / Ready for Deployment has NOT been
+// signed off by QA yet, so it still needs bug-fix budget reserved against it. Only Done
+// work is exempt from the QA/bug-fix buffer.
+function isDoneStatus(row) {
+  return normalizeStatusName(row?.fields?.status?.name) === 'done';
+}
+
+// Rolls an epic up from its child stories' estimates, skipping ignored children plus any
+// the caller's `shouldExclude` predicate rejects. Every non-epic key passes through
+// unchanged from roughMap, so callers can swap roughMap for the result at any scheduling
+// call site without special-casing which row is an epic. Two maps are built from this:
+//  • remainingEstMap  (excludes isDevDoneStatus) — drives BAR DURATION: how much dev time
+//    is genuinely left, so a mostly-finished epic doesn't block the timeline for its full
+//    original size.
+//  • bugFixBaseMap    (excludes isDoneStatus)    — drives the QA/BUG-FIX BUFFER: work that's
+//    dev-complete but not QA-signed-off still needs rework time reserved, so those hours
+//    must stay in this base even though they've dropped out of the duration above.
+function buildEpicRollupMap(epics, storiesByEpic, roughMap, shouldExclude) {
+  const map = { ...roughMap };
+  epics.forEach(epic => {
+    const childStories = storiesByEpic[epic.key] || [];
+    if (!childStories.length) return;
+    let sum = 0;
+    childStories.forEach(story => {
+      if (isIgnoredStatus(story) || shouldExclude(story)) return;
+      sum += roughMap[story.key] || 0;
+    });
+    map[epic.key] = sum;
+  });
+  return map;
+}
+
+// The QA/bug-fix base, built on top of the rollup above. The story-level rollup alone isn't
+// enough: an epic can have every one of its stories already signed off as Done while the EPIC
+// itself still sits in In Review / Ready for Testing / Ready for Deployment — it's in QA right
+// now. The rollup returns 0 for it, which zeroed the rework budget and rendered a bare 1-day
+// bar with no QA/Fix tail at all. Rework is proportional to the code that was WRITTEN, not to
+// the zero dev hours left, so fall back to the epic's own total whenever the epic itself
+// hasn't reached Done. Only a genuinely Done (or ignored) epic gets no buffer.
+function buildBugFixBaseMap(epics, storiesByEpic, roughMap) {
+  const map = buildEpicRollupMap(epics, storiesByEpic, roughMap, isDoneStatus);
+  epics.forEach(epic => {
+    if (isIgnoredStatus(epic) || isDoneStatus(epic)) return;
+    if (!(map[epic.key] > 0)) map[epic.key] = roughMap[epic.key] || 0;
+  });
+  return map;
+}
+
+// Estimate COVERAGE per epic — how many of its (non-ignored) child stories actually have a
+// usable estimate, counting a story as estimated when roughMap has a value for it (so its
+// own estimate OR a rolled-up sum from its leaf children both qualify). An epic's total can
+// look healthy while covering a fraction of its real scope: 10 stories with only 1 estimated
+// rolls up a number that represents 10% of the work. Surfaced as a per-epic badge so a
+// misleadingly-small total is obvious instead of silently under-planning the timeline.
+// Counts only REAL estimates (storyRealHours — the story's own value or a sum of its
+// subtasks' own values), never a share inherited from the epic. Otherwise the badge would
+// read 100% for exactly the epics this is meant to flag: ones estimated as a single lump
+// whose individual stories were never sized.
+function buildEstCoverageMap(epics, storiesByEpic, subtasksByStory, mode, fieldId) {
+  const map = {};
+  epics.forEach(epic => {
+    const childStories = (storiesByEpic[epic.key] || []).filter(s => !isIgnoredStatus(s));
+    if (!childStories.length) return;
+    const estimated = childStories.filter(s => storyRealHours(s, subtasksByStory, mode, fieldId) > 0).length;
+    map[epic.key] = {
+      total: childStories.length,
+      estimated,
+      pct: Math.round((estimated / childStories.length) * 100),
+    };
+  });
+  return map;
+}
+
 // Finds the timestamp of the first transition INTO "In Progress", and the first
 // transition into "In Review" that happens after it, from a changelog's history
 // entries (module-level, pure — see getIssueChangelog in bridge.js).
@@ -72,80 +211,127 @@ function extractStatusDates(histories) {
 
 // ── Est value computation (module-level to avoid TDZ in minified output) ──────
 
+// An issue's OWN estimate in hours, per mode — the Rough Estimation custom field in
+// 'rough' mode, Jira's native Original Estimate (stored in seconds) in 'children' mode.
+// Returns 0 when absent/unusable so callers can just compare against 0.
+function ownEstHours(issue, mode, fieldId) {
+  if (!issue || !issue.key) return 0;
+  if (mode === 'rough') {
+    if (!fieldId) return 0;
+    var val = issue.fields && issue.fields[fieldId];
+    var n = Number(val);
+    return (val != null && !isNaN(n) && n > 0) ? n : 0;
+  }
+  var secs = issue.fields && issue.fields.timeoriginalestimate;
+  return secs > 0 ? secs / 3600 : 0;
+}
+
+// Children frequently carry no estimate of their own while their parent does — a team
+// estimates at epic or story level and breaks the work into unestimated children. Rather
+// than treating those children (and therefore any total rolled up FROM them) as
+// unestimated, spread the parent's UNACCOUNTED hours evenly over the children that lack a
+// value: remainder = parentHours - (sum of children that DO have one), never below 0. The
+// children then sum to max(parentHours, knownSum) — the parent's number is honored, and
+// estimates already entered are never overwritten or double-counted.
+// `childHours` reads a child's own value, so real data always wins over an inherited share.
+function distributeParentEst(parentHours, children, childHours, map) {
+  if (!(parentHours > 0) || !children || !children.length) return;
+  var unknown = children.filter(function(c) { return childHours(c) <= 0; });
+  if (!unknown.length) return;
+  var knownSum = children.reduce(function(t, c) { return t + childHours(c); }, 0);
+  var remainder = Math.max(0, parentHours - knownSum);
+  if (remainder <= 0) return;
+  var share = remainder / unknown.length;
+  unknown.forEach(function(c) { map[c.key] = share; });
+}
+
+// A story's estimate with NO inheritance from its epic — its own value, or failing that the
+// sum of its subtasks' own values. This is the "does this story really carry an estimate?"
+// test, used both to decide which stories should inherit a share of their epic's total and
+// to compute the coverage badge (which must stay honest: a story that only has an inherited
+// share must NOT count as estimated, or the badge would report 100% coverage for an epic
+// whose stories were never estimated at all).
+function storyRealHours(story, subtasksByStory, mode, fieldId) {
+  var own = ownEstHours(story, mode, fieldId);
+  if (own > 0) return own;
+  var subs = (subtasksByStory && subtasksByStory[story.key]) || [];
+  return subs.reduce(function(t, s) { return t + ownEstHours(s, mode, fieldId); }, 0);
+}
+
 function buildRoughMap(mode, epics, storiesByEpic, subtasksByStory, fieldId) {
   const map = {};
-  if (mode === 'rough') {
-    const extract = (issue) => {
-      if (!issue || !issue.key || !fieldId) return;
-      const val = issue.fields && issue.fields[fieldId];
-      if (val != null && !isNaN(Number(val)) && Number(val) > 0) {
-        map[issue.key] = Number(val);
-      }
-    };
-    epics.forEach(extract);
-    Object.values(storiesByEpic).flat().forEach(extract);
-    Object.values(subtasksByStory).flat().forEach(extract);
-  } else {
-    // children mode — subtasks are leaves, use their own timeoriginalestimate
-    Object.values(subtasksByStory).flat().forEach(function(sub) {
-      var own = sub.fields && sub.fields.timeoriginalestimate;
-      if (own) map[sub.key] = own / 3600;
-    });
-    // stories: sum subtasks' timeoriginalestimate
-    Object.values(storiesByEpic).flat().forEach(function(story) {
+  // Every issue's own estimate first (all three levels), in either mode.
+  const allStories = Object.values(storiesByEpic).flat();
+  const allSubtasks = Object.values(subtasksByStory).flat();
+  [].concat(epics, allStories, allSubtasks).forEach(function(issue) {
+    var own = ownEstHours(issue, mode, fieldId);
+    if (own > 0) map[issue.key] = own;
+  });
+
+  // Epic → stories: an epic estimated as a single number (very common in 'rough' mode)
+  // whose stories carry nothing of their own would otherwise roll up to 0 and lose its real
+  // total entirely. Give each unestimated story a share, so per-story scheduling and the
+  // status-aware rollups below have something truthful to work with.
+  epics.forEach(function(epic) {
+    distributeParentEst(
+      ownEstHours(epic, mode, fieldId),
+      storiesByEpic[epic.key] || [],
+      function(s) { return storyRealHours(s, subtasksByStory, mode, fieldId); },
+      map
+    );
+  });
+
+  // Story → subtasks: same idea one level down. Uses the story's EFFECTIVE hours (possibly
+  // just inherited from its epic above) so the share reaches all the way to the leaves.
+  allStories.forEach(function(story) {
+    var subs = (subtasksByStory && subtasksByStory[story.key]) || [];
+    distributeParentEst(
+      map[story.key] || 0,
+      subs,
+      function(s) { return ownEstHours(s, mode, fieldId); },
+      map
+    );
+  });
+
+  if (mode === 'children') {
+    // A story's total rolls up from its subtasks — but never below what it already has, so a
+    // story whose subtasks are all unestimated still reports the hours it was estimated at
+    // (previously this summed to 0 and silently zeroed out the story AND its epic).
+    allStories.forEach(function(story) {
       var subs = (subtasksByStory && subtasksByStory[story.key]) || [];
-      if (subs.length > 0) {
-        var total = subs.reduce(function(t, sub) { return t + ((sub.fields && sub.fields.timeoriginalestimate) || 0); }, 0);
-        if (total > 0) map[story.key] = total / 3600;
-      } else {
-        var own = story.fields && story.fields.timeoriginalestimate;
-        if (own) map[story.key] = own / 3600;
-      }
+      if (!subs.length) return; // no children — its own estimate (set above) stands
+      var subSum = subs.reduce(function(t, sub) { return t + (map[sub.key] || 0); }, 0);
+      var total = Math.max(subSum, map[story.key] || 0);
+      if (total > 0) map[story.key] = total;
     });
-    // epics: sum stories
+    // epics: sum stories, but never drop below the epic's own estimate — otherwise an epic
+    // whose stories are all unestimated reports 0h and gets scheduled as a single day.
     epics.forEach(function(epic) {
       var childStories = storiesByEpic[epic.key] || [];
       var epicSum = childStories.reduce(function(t, s) { return t + (map[s.key] || 0); }, 0);
-      if (epicSum > 0) map[epic.key] = epicSum;
+      var total = Math.max(epicSum, map[epic.key] || 0);
+      if (total > 0) map[epic.key] = total;
     });
   }
   return map;
 }
 
-function buildMissingEstMap(mode, epics, storiesByEpic, subtasksByStory, fieldId, roughMap) {
+// Flagged = "we cannot compute a duration for this row", which is exactly
+// `roughMap[key] <= 0`. Deliberately keyed off the already-built roughMap rather than
+// re-reading raw fields, so every fallback roughMap applies (a story falling back to its
+// own estimate when its subtasks are unestimated, a subtask inheriting a share of its
+// parent's, an epic rolling up from its stories) automatically counts as estimated here
+// too — otherwise rows we CAN schedule would still be reported as missing estimates.
+// A parent with children never needs its own estimate: its rolled-up total is what matters.
+function buildMissingEstMap(epics, storiesByEpic, subtasksByStory, roughMap) {
   var missing = {};
-  if (mode === 'rough') {
-    var checkIssue = function(issue) {
-      if (!issue || !issue.key) return;
-      var val = fieldId ? (issue.fields && issue.fields[fieldId]) : null;
-      if (val == null || isNaN(Number(val)) || Number(val) <= 0) missing[issue.key] = true;
-    };
-    epics.forEach(checkIssue);
-    Object.values(storiesByEpic).flat().forEach(checkIssue);
-    Object.values(subtasksByStory).flat().forEach(checkIssue);
-  } else {
-    Object.values(subtasksByStory).flat().forEach(function(sub) {
-      if (!(sub.fields && sub.fields.timeoriginalestimate)) missing[sub.key] = true;
-    });
-    Object.values(storiesByEpic).flat().forEach(function(story) {
-      var subs = (subtasksByStory && subtasksByStory[story.key]) || [];
-      if (subs.length > 0) {
-        if (subs.some(function(s) { return !(s.fields && s.fields.timeoriginalestimate); })) {
-          missing[story.key] = true;
-        }
-      } else if (!(story.fields && story.fields.timeoriginalestimate)) {
-        missing[story.key] = true;
-      }
-    });
-    epics.forEach(function(epic) {
-      var childStories = storiesByEpic[epic.key] || [];
-      if (childStories.length === 0) return;
-      // A parent with children never needs its own estimate — only flag the epic when
-      // its whole rolled-up total (buildRoughMap's own epic-sum) is unusable, not merely
-      // because some individual child story happens to be flagged.
-      if (!(roughMap && roughMap[epic.key] > 0)) missing[epic.key] = true;
-    });
-  }
+  var flag = function(issue) {
+    if (!issue || !issue.key) return;
+    if (!(roughMap && roughMap[issue.key] > 0)) missing[issue.key] = true;
+  };
+  epics.forEach(flag);
+  Object.values(storiesByEpic).flat().forEach(flag);
+  Object.values(subtasksByStory).flat().forEach(flag);
   return missing;
 }
 
@@ -165,7 +351,7 @@ function computeChildSpan(childKeys, computedPlan, roughMap, workingDays, dayWid
       var ei = workingDays.indexOf(snapToWorkingDay(entry.actualEndDate));
       if (ei > startIdx) endIdx = ei;
     } else {
-      var devs = (entry.assignedPlaceholders || []).length || 1;
+      var devs = effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders);
       endIdx = startIdx + calcDays(roughMap[key], devs) - 1;
     }
     placed++;
@@ -245,18 +431,24 @@ function ColResizer({ colKey, setColWidths, min }) {
 }
 
 // ── Sort value extraction — module-level, pure ───────────────────────────────
-function getSortValue(row, col, roughMap, computedPlan) {
+// roughMap = the TRUE total estimate (Total Est column); schedMap = whatever's actually
+// used for scheduling duration (Draft mode: remaining estimate; everything else: same as
+// roughMap) — 'days' sorts by schedMap so it matches what's rendered on the Gantt, while
+// 'est'/'remaining' each sort by their own always-true value regardless of mode.
+function getSortValue(row, col, roughMap, schedMap, computedPlan, rawRoughMap) {
   var f = row.fields || {};
   var entry = (computedPlan.issues && computedPlan.issues[row.key]) || {};
   switch (col) {
     case 'key': return row.key;
     case 'summary': return (f.summary || '').toLowerCase();
     case 'est': { var h = roughMap[row.key]; return h == null ? -Infinity : h; }
+    case 'rough': { var rr = (rawRoughMap || {})[row.key]; return rr == null ? -Infinity : rr; }
+    case 'remaining': { var rem = schedMap[row.key]; return rem == null ? -Infinity : rem; }
     case 'assigned': return (entry.assignedPlaceholders || []).length;
     case 'qa': return entry.qaHours || 0;
     case 'days': {
-      var devs = (entry.assignedPlaceholders || []).length || 0;
-      var rh = roughMap[row.key];
+      var devs = entry.assignedPlaceholders?.length ? effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders) : 0;
+      var rh = schedMap[row.key];
       return rh && devs ? calcDays(rh, devs) : -Infinity;
     }
     default: return 0;
@@ -270,7 +462,7 @@ function computeProjectSpan(computedPlan, roughMapArg) {
   Object.entries(computedPlan.issues || {}).forEach(function(entry) {
     var key = entry[0], e = entry[1];
     if (!e.startDate) return;
-    var devs = (e.assignedPlaceholders || []).length || 1;
+    var devs = effectiveDevCount(e.assignedPlaceholders, computedPlan.placeholders);
     var end = calcEndDate(e.startDate, roughMapArg[key], devs) || e.startDate;
     if (!earliest || e.startDate < earliest) earliest = e.startDate;
     if (!latest || end > latest) latest = end;
@@ -292,7 +484,7 @@ function computeCriticalPath(computedPlan, roughMapArg) {
   Object.entries(issues).forEach(function(entry) {
     var key = entry[0], e = entry[1];
     if (!e.startDate) return;
-    var devs = (e.assignedPlaceholders || []).length || 1;
+    var devs = effectiveDevCount(e.assignedPlaceholders, computedPlan.placeholders);
     endDates[key] = calcEndDate(e.startDate, roughMapArg[key], devs) || e.startDate;
   });
   var keys = Object.keys(endDates);
@@ -315,14 +507,25 @@ function computeCriticalPath(computedPlan, roughMapArg) {
 
 function computeDevUtilization(computedPlan, roughMapArg) {
   var utils = {};
+  var phById = {};
+  (computedPlan.placeholders || []).forEach(function(p) { phById[p.id] = p; });
   Object.entries(computedPlan.issues || {}).forEach(function(entry) {
     var key = entry[0], e = entry[1];
     if (!e.startDate) return;
     var hours = roughMapArg[key] || 0;
     var phs = e.assignedPlaceholders || [];
+    // Split hours proportionally to each assigned dev's capacity — a dev at 50%
+    // capacity takes on proportionally less of the work than a full-time dev.
+    var capSum = phs.reduce(function(s, id) {
+      var ph = phById[id];
+      var pct = ph && typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+      return s + pct;
+    }, 0) || 1;
     phs.forEach(function(phId) {
+      var ph = phById[phId];
+      var pct = ph && typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
       if (!utils[phId]) utils[phId] = 0;
-      utils[phId] += hours / (phs.length || 1);
+      utils[phId] += hours * (pct / capSum);
     });
   });
   return utils;
@@ -340,9 +543,11 @@ function workingDaysBetween(startStr, endStr) {
   return count;
 }
 
-// ── Summary panel component ───────────────────────────────────────────────────
-function SummaryPanel({ computedPlan, roughMapArg, rows, conflicts, planIndex, selectedPlanId }) {
-  var [open, setOpen] = React.useState(false);
+// ── Summary panel content (rendered inside the right-hand side panel) ─────────
+// Combines what used to be four separate always-visible banners (collapsible
+// summary bar, missing-estimate warning, conflict list, draft-mode caption)
+// into one panel opened on demand via the "📊 Summary" toolbar button.
+function SummaryPanelContent({ computedPlan, roughMapArg, rows, conflicts, missingEstMap, estSource, planningMode, updateIssueEntry }) {
   var span = computeProjectSpan(computedPlan, roughMapArg);
   var unscheduled = computeUnscheduledItems(rows, computedPlan, roughMapArg);
   var critPath = computeCriticalPath(computedPlan, roughMapArg);
@@ -350,87 +555,151 @@ function SummaryPanel({ computedPlan, roughMapArg, rows, conflicts, planIndex, s
   var totalDays = workingDaysBetween(span.start, span.end);
   var unschHours = unscheduled.reduce(function(s, u) { return s + u.hours; }, 0);
   var placeholders = computedPlan.placeholders || [];
-  var hasData = span.start || unscheduled.length > 0 || conflicts.length > 0;
-  if (!hasData) return null;
+  var missingCount = Object.keys(missingEstMap || {}).length;
+  var hasData = span.start || unscheduled.length > 0 || conflicts.length > 0 || missingCount > 0;
+
+  if (!hasData && planningMode !== 'draft') {
+    return <div style={{ padding: 16, fontSize: 12, color: '#97A0AF' }}>Nothing to report yet — schedule some work to see the summary here.</div>;
+  }
 
   return (
-    <div style={{ background: '#F4F5F7', borderBottom: '1px solid #DFE1E6', flexShrink: 0 }}>
-      <button onClick={function() { setOpen(function(o) { return !o; }); }}
-        style={{ width: '100%', textAlign: 'left', padding: '6px 16px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
-        <span style={{ fontSize: 10, color: '#5E6C84' }}>{open ? '▼' : '▶'}</span>
-        <span style={{ fontWeight: 700, color: '#172B4D' }}>Summary</span>
-        {span.start && <span style={{ color: '#5E6C84' }}>{span.start} → {span.end} · {totalDays}d</span>}
-        {unscheduled.length > 0 && <span style={{ color: '#FF991F' }}>· {unscheduled.length} unscheduled ({(unschHours || 0).toFixed(0)}h)</span>}
-        {conflicts.length > 0 && <span style={{ color: '#DE350B' }}>· {conflicts.length} conflict{conflicts.length !== 1 ? 's' : ''}</span>}
-        {critPath.length > 0 && <span style={{ color: '#5E6C84', marginLeft: 'auto', fontSize: 11 }}>Critical path: {critPath.length} issues</span>}
-      </button>
+    <div style={{ padding: 14, fontSize: 11 }}>
+      {planningMode === 'draft' && (
+        <div style={{ marginBottom: 10, padding: '6px 10px', background: '#EAE6FF', borderRadius: 4, color: '#403294' }}>
+          <strong>Draft mode:</strong> Epics only · Duration = rough est ÷ devs · Assigning the same developer to multiple epics auto-creates dependencies
+        </div>
+      )}
 
-      {open && (
-        <div style={{ padding: '0 16px 10px', fontSize: 11 }}>
-          {/* Span */}
-          {span.start && (
-            <div style={{ marginBottom: 6, color: '#172B4D' }}>
-              📅 <strong>{span.start}</strong> → <strong>{span.end}</strong>
-              {totalDays > 0 && <span style={{ color: '#5E6C84' }}> · {totalDays} working days</span>}
+      {/* Span */}
+      {span.start && (
+        <div style={{ marginBottom: 8, color: '#172B4D' }}>
+          📅 <strong>{span.start}</strong> → <strong>{span.end}</strong>
+          {totalDays > 0 && <span style={{ color: '#5E6C84' }}> · {totalDays} working days</span>}
+        </div>
+      )}
+
+      {/* Unscheduled */}
+      {unscheduled.length > 0 && (
+        <div style={{ marginBottom: 8, color: '#974F0C' }}>
+          ⚠ {unscheduled.length} stor{unscheduled.length === 1 ? 'y' : 'ies'} not yet scheduled
+          {unschHours > 0 && <span> ({unschHours.toFixed(0)}h of work)</span>}
+        </div>
+      )}
+
+      {/* Missing estimates */}
+      {missingCount > 0 && (
+        <div style={{ marginBottom: 8, color: '#974F0C' }}>
+          ⚠ {missingCount} issue(s) have missing or incomplete estimates
+          {estSource === 'children' ? ' (some tasks/subtasks have no Original Estimate)' : ' (Rough Estimation field not set)'}.
+          Duration calculations for those rows may be inaccurate.
+        </div>
+      )}
+
+      {/* Conflicts */}
+      {conflicts.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ color: '#DE350B', fontWeight: 700, marginBottom: 4 }}>🔴 {conflicts.length} conflict{conflicts.length !== 1 ? 's' : ''}</div>
+          {conflicts.map((c, i) => (
+            <div key={i} style={{ color: '#974F0C', marginBottom: 3 }}>
+              {c.placeholder.name}: {c.source} ↔ {c.target} overlap —
+              <button onClick={() => {
+                updateIssueEntry(c.target, {
+                  dependencies: [...new Set([...(computedPlan.issues?.[c.target]?.dependencies || []), c.source])],
+                });
+              }} style={{ marginLeft: 4, fontSize: 10, border: '1px solid #FFD700', background: '#FFF0B3', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', color: '#974F0C' }}>
+                Auto-chain
+              </button>
             </div>
-          )}
+          ))}
+        </div>
+      )}
 
-          {/* Unscheduled */}
-          {unscheduled.length > 0 && (
-            <div style={{ marginBottom: 6, color: '#974F0C' }}>
-              ⚠ {unscheduled.length} stor{unscheduled.length === 1 ? 'y' : 'ies'} not yet scheduled
-              {unschHours > 0 && <span> ({unschHours.toFixed(0)}h of work)</span>}
-            </div>
-          )}
+      {/* Critical path */}
+      {critPath.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <span style={{ color: '#DE350B', fontWeight: 700 }}>🔴 Critical path</span>
+          <div style={{ color: '#5E6C84', marginTop: 2 }}>
+            {critPath.map(function(k) {
+              var e = computedPlan.issues && computedPlan.issues[k];
+              var devs = (e && e.assignedPlaceholders ? e.assignedPlaceholders.length : 0) || 1;
+              var d = calcDays(roughMapArg[k], devs);
+              return k + ' (' + d + 'd)';
+            }).join(' → ')}
+          </div>
+          <div style={{ color: '#97A0AF', marginTop: 2 }}>— any delay here pushes the end date</div>
+        </div>
+      )}
 
-          {/* Critical path */}
-          {critPath.length > 0 && (
-            <div style={{ marginBottom: 6 }}>
-              <span style={{ color: '#DE350B', fontWeight: 700 }}>🔴 Critical path</span>
-              <span style={{ color: '#5E6C84', marginLeft: 6 }}>
-                {critPath.map(function(k) {
-                  var e = computedPlan.issues && computedPlan.issues[k];
-                  var devs = (e && e.assignedPlaceholders ? e.assignedPlaceholders.length : 0) || 1;
-                  var d = calcDays(roughMapArg[k], devs);
-                  return k + ' (' + d + 'd)';
-                }).join(' → ')}
-              </span>
-              <span style={{ color: '#97A0AF', marginLeft: 8 }}>— any delay here pushes the end date</span>
-            </div>
-          )}
-
-          {/* Developer utilization */}
-          {placeholders.length > 0 && Object.keys(devUtils).length > 0 && (
-            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 4 }}>
-              {placeholders.map(function(ph) {
-                var hours = devUtils[ph.id] || 0;
-                var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY : 1;
-                var pct = Math.min(hours / cap, 1);
-                var barColor = pct > 1 ? '#FF5630' : pct > 0.8 ? '#FF991F' : ph.color;
-                return (
-                  <div key={ph.id} style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 140 }}>
-                    <span style={{ fontWeight: 600, color: ph.color, width: 60, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ph.name}</span>
-                    <div style={{ width: 80, height: 6, background: '#DFE1E6', borderRadius: 3, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', background: barColor, borderRadius: 3, width: (pct * 100) + '%' }} />
-                    </div>
-                    <span style={{ color: '#5E6C84', whiteSpace: 'nowrap' }}>{hours.toFixed(0)}h</span>
+      {/* Developer utilization */}
+      {placeholders.length > 0 && Object.keys(devUtils).length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Developer utilization</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {placeholders.map(function(ph) {
+              var hours = devUtils[ph.id] || 0;
+              var capacityPct = typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+              var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY * (capacityPct / 100) : 1;
+              var pct = Math.min(hours / cap, 1);
+              var barColor = pct > 1 ? '#FF5630' : pct > 0.8 ? '#FF991F' : ph.color;
+              return (
+                <div key={ph.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontWeight: 600, color: ph.color, width: 70, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 0 }}>{ph.name}{capacityPct < 100 ? ` (${capacityPct}%)` : ''}</span>
+                  <div style={{ flex: 1, height: 6, background: '#DFE1E6', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', background: barColor, borderRadius: 3, width: (pct * 100) + '%' }} />
                   </div>
-                );
-              })}
-            </div>
-          )}
+                  <span style={{ color: '#5E6C84', whiteSpace: 'nowrap', flexShrink: 0 }}>{hours.toFixed(0)}h</span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
+// ── Toolbar button that opens/closes a right-hand side panel tab ──────────────
+function PanelToggleBtn({ icon, label, active, badge, badgeColor, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      display: 'flex', alignItems: 'center', gap: 5, padding: '5px 10px', fontSize: 11, fontWeight: 600,
+      cursor: 'pointer', borderRadius: 4, border: `1.5px solid ${active ? '#0052CC' : '#DFE1E6'}`,
+      background: active ? '#0052CC' : '#fff', color: active ? '#fff' : '#42526E',
+    }}>
+      <span>{icon}</span>
+      <span>{label}</span>
+      {!!badge && (
+        <span style={{
+          fontSize: 10, fontWeight: 700, borderRadius: 8, padding: '0 5px', minWidth: 15, textAlign: 'center',
+          background: active ? 'rgba(255,255,255,0.25)' : (badgeColor || '#DE350B'), color: active ? '#fff' : '#fff',
+        }}>{badge}</span>
+      )}
+    </button>
+  );
+}
+
+// ── Right-hand side panel shell — one tab's content at a time ─────────────────
+function SidePanel({ title, onClose, children }) {
+  return (
+    <div style={{ width: 340, flexShrink: 0, borderLeft: '1px solid #DFE1E6', background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid #DFE1E6', background: '#FAFBFC', flexShrink: 0 }}>
+        <strong style={{ fontSize: 13, color: '#172B4D' }}>{title}</strong>
+        <button onClick={onClose} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#5E6C84', fontSize: 16, lineHeight: 1, padding: 2 }}>×</button>
+      </div>
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 // ── Plan dialog modal (replaces window.prompt/confirm — blocked in Forge iframes) ─
-function PlanDialogModal({ dialog, onClose, onCreate, onSaveAs, onRename, onDelete, onClear }) {
+function PlanDialogModal({ dialog, onClose, onCreate, onSaveAs, onRename, onDelete, onClear, onClearAllScheduling }) {
   var [nameValue, setNameValue] = React.useState(dialog.defaultName || '');
   var [busy, setBusy] = React.useState(false);
   var isNameType = dialog.type === 'new' || dialog.type === 'saveas' || dialog.type === 'rename';
-  var titles = { new: 'New plan', saveas: 'Save plan as…', rename: 'Rename plan', delete: 'Delete plan', clear: 'Clear plan' };
+  var isClearAllScheduling = dialog.type === 'clearAllScheduling';
+  var titles = { new: 'New plan', saveas: 'Save plan as…', rename: 'Rename plan', delete: 'Delete plan', clear: 'Clear plan', clearAllScheduling: 'Clear all scheduling' };
   var labels = { new: 'Create', saveas: 'Save', rename: 'Rename', delete: 'Delete', clear: 'Clear' };
   var isDanger = dialog.type === 'delete' || dialog.type === 'clear';
   async function handleConfirm() {
@@ -449,10 +718,21 @@ function PlanDialogModal({ dialog, onClose, onCreate, onSaveAs, onRename, onDele
       onClose();
     }
   }
+  async function handleClearAllScheduling(removeJiraDueDates) {
+    setBusy(true);
+    try {
+      await onClearAllScheduling(removeJiraDueDates);
+    } catch (e) {
+      // swallow error — always close the modal
+    } finally {
+      setBusy(false);
+      onClose();
+    }
+  }
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(9,30,66,0.54)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       onClick={function(e) { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: 320, boxShadow: '0 8px 32px rgba(0,0,0,0.22)' }}>
+      <div style={{ background: '#fff', borderRadius: 8, padding: 24, width: isClearAllScheduling ? 380 : 320, boxShadow: '0 8px 32px rgba(0,0,0,0.22)' }}>
         <div style={{ fontWeight: 700, fontSize: 15, color: '#172B4D', marginBottom: 14 }}>{titles[dialog.type]}</div>
         {isNameType && (
           <input autoFocus value={nameValue} onChange={function(e) { setNameValue(e.target.value); }}
@@ -460,35 +740,63 @@ function PlanDialogModal({ dialog, onClose, onCreate, onSaveAs, onRename, onDele
             placeholder="Plan name"
             style={{ width: '100%', padding: '8px 10px', border: '2px solid #DFE1E6', borderRadius: 4, fontSize: 13, outline: 'none', boxSizing: 'border-box', marginBottom: 16 }} />
         )}
-        {!isNameType && (
+        {!isNameType && !isClearAllScheduling && (
           <p style={{ fontSize: 13, color: '#5E6C84', marginBottom: 16 }}>
             {dialog.type === 'delete' ? 'This plan and all its data will be permanently deleted.' : 'All assignments, placeholders, and milestones will be cleared.'}
           </p>
         )}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-          <button onClick={onClose} style={{ padding: '6px 14px', borderRadius: 4, border: '1.5px solid #DFE1E6', background: '#F4F5F7', color: '#42526E', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
-          <button onClick={handleConfirm} disabled={busy || (isNameType && !nameValue.trim())}
-            style={{ padding: '6px 14px', borderRadius: 4, border: 'none', background: isDanger ? '#DE350B' : '#0052CC', color: '#fff', fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer', opacity: (isNameType && !nameValue.trim()) ? 0.5 : 1 }}>
-            {busy ? '…' : labels[dialog.type]}
-          </button>
-        </div>
+        {isClearAllScheduling && (
+          <p style={{ fontSize: 13, color: '#5E6C84', marginBottom: 16 }}>
+            This clears every scheduled date in view. Do you also want to remove the matching due dates already saved on these issues in Jira?
+          </p>
+        )}
+        {!isClearAllScheduling && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <button onClick={onClose} style={{ padding: '6px 14px', borderRadius: 4, border: '1.5px solid #DFE1E6', background: '#F4F5F7', color: '#42526E', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+            <button onClick={handleConfirm} disabled={busy || (isNameType && !nameValue.trim())}
+              style={{ padding: '6px 14px', borderRadius: 4, border: 'none', background: isDanger ? '#DE350B' : '#0052CC', color: '#fff', fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer', opacity: (isNameType && !nameValue.trim()) ? 0.5 : 1 }}>
+              {busy ? '…' : labels[dialog.type]}
+            </button>
+          </div>
+        )}
+        {isClearAllScheduling && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={onClose} disabled={busy} style={{ padding: '6px 14px', borderRadius: 4, border: '1.5px solid #DFE1E6', background: '#F4F5F7', color: '#42526E', fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>Cancel</button>
+            <button onClick={() => handleClearAllScheduling(false)} disabled={busy} style={{ padding: '6px 14px', borderRadius: 4, border: '1.5px solid #FFD700', background: '#FFF0B3', color: '#974F0C', fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>
+              {busy ? '…' : 'Clear only'}
+            </button>
+            <button onClick={() => handleClearAllScheduling(true)} disabled={busy} style={{ padding: '6px 14px', borderRadius: 4, border: 'none', background: '#DE350B', color: '#fff', fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>
+              {busy ? '…' : 'Clear + remove Jira due dates'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 // ── Small reusable UI pieces ───────────────────────────────────────────────────
-function Chip({ label, color, onRemove, onClick, selected }) {
+// `initials` turns the plain color dot into a labelled avatar (2-letter initials) — used for
+// developer chips, where a bare dot made it hard to tell who's who at a glance.
+function Chip({ label, color, onRemove, onClick, selected, initials }) {
   return (
     <span onClick={onClick} style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
       background: selected ? color + '33' : '#F4F5F7',
       border: `1.5px solid ${selected ? color : '#DFE1E6'}`,
-      borderRadius: 12, padding: '2px 8px 2px 6px',
+      borderRadius: 12, padding: '2px 8px 2px 4px',
       fontSize: 11, fontWeight: 600, cursor: onClick ? 'pointer' : 'default',
       color: selected ? color : '#42526E',
     }}>
-      <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0 }} />
+      {initials ? (
+        <span style={{
+          width: 18, height: 18, borderRadius: '50%', background: color, flexShrink: 0,
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 8, fontWeight: 800, color: '#fff', letterSpacing: '-0.02em',
+        }}>{initials}</span>
+      ) : (
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0, marginLeft: 2 }} />
+      )}
       {label}
       {onRemove && (
         <span onClick={e => { e.stopPropagation(); onRemove(); }}
@@ -535,11 +843,13 @@ function DeliveryReport({ computedPlan, roughMap, planName, mode, codeFreezeDate
     }
     if (placeholders.length > 0) {
       lines.push(''); lines.push('## Team');
-      var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY : 1;
       placeholders.forEach(function(ph) {
         var h = devUtils[ph.id] || 0;
+        var capacityPct = typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+        var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY * (capacityPct / 100) : 1;
         var pct = Math.round(h / cap * 100);
-        lines.push('- **' + ph.name + '**: ' + h.toFixed(0) + 'h / ' + cap.toFixed(0) + 'h (' + pct + '%)');
+        var label = capacityPct < 100 ? ph.name + ' (' + capacityPct + '%)' : ph.name;
+        lines.push('- **' + label + '**: ' + h.toFixed(0) + 'h / ' + cap.toFixed(0) + 'h (' + pct + '%)');
       });
     }
     return lines.join('\n');
@@ -631,13 +941,14 @@ function DeliveryReport({ computedPlan, roughMap, planName, mode, codeFreezeDate
                 <div style={{ fontSize: 10, color: '#5E6C84', fontWeight: 700, textTransform: 'uppercase', marginBottom: 6 }}>Team Utilization</div>
                 {placeholders.map(function(ph) {
                   var hours = devUtils[ph.id] || 0;
-                  var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY : 1;
+                  var capacityPct = typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+                  var cap = totalDays > 0 ? totalDays * HOURS_PER_DAY * (capacityPct / 100) : 1;
                   var pct = hours / cap;
                   var overloaded = pct > 1;
                   var barColor = overloaded ? '#FF5630' : pct > 0.8 ? '#FF991F' : ph.color;
                   return (
                     <div key={ph.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                      <span style={{ width: 76, fontSize: 11, fontWeight: 600, color: ph.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 0 }}>{ph.name}</span>
+                      <span style={{ width: 76, fontSize: 11, fontWeight: 600, color: ph.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 0 }}>{ph.name}{capacityPct < 100 ? ` (${capacityPct}%)` : ''}</span>
                       <div style={{ width: 90, height: 7, background: '#DFE1E6', borderRadius: 4, overflow: 'hidden', flexShrink: 0 }}>
                         <div style={{ height: '100%', background: barColor, width: Math.min(pct, 1) * 100 + '%', borderRadius: 4 }} />
                       </div>
@@ -682,10 +993,13 @@ function DeliveryReport({ computedPlan, roughMap, planName, mode, codeFreezeDate
 export default function VersionPlanningView({ projectKeys }) {
   const [selectedVersionId, setSelectedVersionId] = useState(null);
   const [roughEstFieldId, setRoughEstFieldId] = useState(null);
+  const [startDateFieldId, setStartDateFieldId] = useState(null);
   const [estSource, setEstSource] = useState('rough'); // 'rough' | 'children'
   const [planningMode, setPlanningMode] = useState('draft'); // 'draft' | 'final' | 'epic'
+  const [epicPlanKind, setEpicPlanKind] = useState('draft'); // Epic Timeline mode's own nested Draft/Final choice
   const [bugFixPct, setBugFixPct] = useState(20);      // % of dev time spent on bug fixes after QA
   const [bufferDays, setBufferDays] = useState(0);     // Epic Timeline mode: extra working days after each dependency ends
+  const [autoDepByDev, setAutoDepByDev] = useState(true); // Draft mode: dropping an epic chains it behind the same dev's previous epic
   const [codeFreezeDays, setCodeFreezeDays] = useState(5);   // working days from last epic to code freeze
   const [stabilizationDays, setStabilizationDays] = useState(10); // working days of stabilization period
   const [planStart, setPlanStart] = useState(() => snapToWorkingDay(TODAY_STR));
@@ -694,11 +1008,13 @@ export default function VersionPlanningView({ projectKeys }) {
   const [focusEpicKey, setFocusEpicKey] = useState(null); // Epic Timeline mode: which epic is focused
   const [changelogCache, setChangelogCache] = useState({}); // issueKey -> { inProgressDate, readyDate } | { loading: true } | { error: true }
   const [autoScheduling, setAutoScheduling] = useState(false);
-  const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [focusDevId, setFocusDevId] = useState(null); // click a developer chip to show only their rows
   const [debugCopied, setDebugCopied] = useState(false);
   const [depsMode, setDepsMode] = useState(false);
   const [depsSource, setDepsSource] = useState(null);
+  const [depNote, setDepNote] = useState(null); // transient feedback for reverse/remove dependency actions
+  const [refreshNote, setRefreshNote] = useState(null); // transient feedback after "Refresh from Jira"
+  const [refreshing, setRefreshing] = useState(false);
   const [editingMilestone, setEditingMilestone] = useState(null);
   const [saveStatus, setSaveStatus] = useState(null);
   const [newPhName, setNewPhName] = useState('');
@@ -710,21 +1026,72 @@ export default function VersionPlanningView({ projectKeys }) {
   const [editingEstValue, setEditingEstValue] = useState('');
   const [localRoughEst, setLocalRoughEst] = useState({});
   const [dirtyEstKeys, setDirtyEstKeys] = useState(new Set());
-  const [colWidths, setColWidths] = useState({ key: 140, summary: 114, est: 52, assigned: 90, qa: 44, days: 40 });
+  const [colWidths, setColWidths] = useState({ key: 140, summary: 114, est: 52, rough: 52, remaining: 60, assigned: 90, qa: 44, days: 40 });
   const [sortCol, setSortCol] = useState(null);
   const [sortDir, setSortDir] = useState('asc');
   const [autoSaveStatus, setAutoSaveStatus] = useState(null);
   const [maximized, setMaximized] = useState(false); // fullscreen-overlay the timeline panel
   const [selectedPlanId, setSelectedPlanId] = useState(null);
-  const [overlapAlert, setOverlapAlert] = useState(null);
   const [planDialog, setPlanDialog] = useState(null);
+  const [activePanel, setActivePanel] = useState(null); // null | 'summary' | 'settings' | 'team' | 'tools' | 'debug'
   const leftRef = useRef(null);
   const rightRef = useRef(null);
   const saveTimerRef = useRef(null);
   const initialLoadRef = useRef(false);
-  const prevConflictKeysRef = useRef(new Set());
+  const creatingFinalRef = useRef(false); // guards against double-creating the reserved Final plan
+  const settingsSyncedForPlanRef = useRef(null); // which selectedPlanId the estSource/bugFixPct/etc state was last loaded from
+  const skipNextSettingsWriteRef = useRef(false); // true right after syncing FROM a loaded plan, so that sync doesn't immediately write back
 
-  const { epics, storiesByEpic, subtasksByStory, versions, loading: issuesLoading, error: issuesError } = useEpicHierarchy(projectKeys, selectedVersionId);
+  const { epics, storiesByEpic, subtasksByStory, versions, loading: issuesLoading, error: issuesError, refetch: refetchHierarchy } = useEpicHierarchy(projectKeys, selectedVersionId);
+
+  // Epics/stories are only fetched once on load — new epics added to (or removed from) this
+  // version in Jira since then otherwise need a full page reload to show up. The hook's own
+  // diff is computed on the raw whole-project fetch, before the version filter runs here — so
+  // it only catches an epic vanishing from the project entirely, not one just untagged from
+  // THIS version. Snapshot the current (already version-scoped) `epics` before refetching and
+  // diff against the freshly filtered list once the refetch's state settles instead.
+  const preRefreshEpicKeysRef = useRef(null);
+  function refreshFromJira() {
+    preRefreshEpicKeysRef.current = new Set(epics.map(e => e.key));
+    setRefreshing(true);
+    refetchHierarchy().finally(() => setRefreshing(false));
+  }
+  useEffect(() => {
+    if (refreshing || !preRefreshEpicKeysRef.current) return;
+    const prevKeys = preRefreshEpicKeysRef.current;
+    preRefreshEpicKeysRef.current = null;
+    const newKeys = new Set(epics.map(e => e.key));
+    const added = [...newKeys].filter(k => !prevKeys.has(k));
+    const removed = [...prevKeys].filter(k => !newKeys.has(k));
+    if (!added.length && !removed.length) {
+      setRefreshNote('✓ Up to date — no epic changes in this version');
+    } else {
+      const parts = [];
+      if (added.length) parts.push(`+${added.length} new (${added.join(', ')})`);
+      if (removed.length) parts.push(`−${removed.length} no longer in version (${removed.join(', ')})`);
+      setRefreshNote(parts.join(' · '));
+    }
+  }, [refreshing, epics]);
+  useEffect(() => {
+    if (!refreshNote) return;
+    const t = setTimeout(() => setRefreshNote(null), 8000);
+    return () => clearTimeout(t);
+  }, [refreshNote]);
+  const { sprints, error: sprintsError } = useSprints(projectKeys);
+  useEffect(() => {
+    if (sprintsError) {
+      // eslint-disable-next-line no-console
+      console.warn('[planJira] Failed to load sprints:', sprintsError);
+    }
+  }, [sprintsError]);
+
+  // Unreleased/unarchived versions, ordered (natural/numeric sort so "3.2.0" sorts after
+  // "3.10.0" the way it should, not lexically) — used by every version <select> below.
+  const selectableVersions = useMemo(() => {
+    return versions
+      .filter(v => !v.released && !v.archived)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' }));
+  }, [versions]);
 
   // Epic Timeline mode: narrow the hierarchy fed into the estimate/missing-estimate maps
   // down to just the focused epic — mirrors the storiesByEpic[focusEpicKey] narrowing
@@ -750,23 +1117,60 @@ export default function VersionPlanningView({ projectKeys }) {
   const {
     plan, loading: planLoading, saving, planIndex, indexLoading,
     updateIssueEntry, updatePlan, addPlaceholder, removePlaceholder, renamePlaceholder, recolorPlaceholders,
-    ensurePlaceholderForAssignee,
+    ensurePlaceholderForAssignee, setPlaceholderCapacity, pruneUnusedPlaceholders, resetDismissedAssignees,
     addMilestone, removeMilestone, clearPlan, savePlanToStorage,
     createPlan, renamePlanInIndex, deletePlanFromIndex,
   } = useVersionPlan(projectKeys[0] || null, selectedVersionId, selectedPlanId);
 
   useEffect(() => { resolveRoughEstField().then(setRoughEstFieldId); }, []);
+  useEffect(() => { resolveStartDateField().then(setStartDateFieldId).catch(() => {}); }, []);
+
+  // Every issue in scope, by key — so placement can read an issue's raw Jira date fields
+  // without depending on it being one of the currently-visible rows.
+  const issueByKey = useMemo(() => {
+    const m = {};
+    const all = [].concat(
+      epicScopedHierarchy.epics,
+      Object.values(epicScopedHierarchy.storiesByEpic).flat(),
+      Object.values(epicScopedHierarchy.subtasksByStory).flat()
+    );
+    all.forEach(i => { if (i && i.key) m[i.key] = i; });
+    return m;
+  }, [epicScopedHierarchy]);
 
   // Reset the focused epic when the version changes, since epics are version-scoped
   useEffect(() => { setFocusEpicKey(null); setExpandedStories(new Set()); }, [selectedVersionId]);
 
-  // Auto-select first plan when version changes and plans are loaded
+  // "Final" context: top-level Final mode, or Epic Timeline's own nested Final choice.
+  // There's exactly one reserved, auto-created plan per scope — no picker, no naming,
+  // always saved straight to Jira. Everything else ("Draft") keeps the normal
+  // multi-plan picker (New/Save as/Rename/Delete), with the reserved Final plan(s)
+  // filtered out of that list so they can never be renamed/deleted by accident.
+  const isFinalContext = planningMode === 'final' || (planningMode === 'epic' && epicPlanKind === 'final');
+  const finalTargetName = planningMode === 'epic' ? finalPlanName(focusEpicKey) : FINAL_PLAN_NAME;
+  const draftPlanIndex = useMemo(() => planIndex.filter(p => !isReservedFinalPlanName(p.name)), [planIndex]);
+
+  // Auto-select (or auto-create) the right plan whenever version/mode/epic changes.
   useEffect(() => {
     if (!selectedVersionId) { setSelectedPlanId(null); initialLoadRef.current = false; return; }
-    if (planIndex.length > 0 && !selectedPlanId) {
-      setSelectedPlanId(planIndex[0].id);
+    if (indexLoading) return;
+    if (isFinalContext) {
+      if (planningMode === 'epic' && !focusEpicKey) return; // wait for an epic to be chosen
+      const existing = planIndex.find(p => p.name === finalTargetName);
+      if (existing) {
+        if (selectedPlanId !== existing.id) setSelectedPlanId(existing.id);
+      } else if (!creatingFinalRef.current) {
+        creatingFinalRef.current = true;
+        createPlan(finalTargetName).then(newId => { creatingFinalRef.current = false; setSelectedPlanId(newId); });
+      }
+      return;
     }
-  }, [selectedVersionId, planIndex]);
+    if (selectedPlanId && draftPlanIndex.some(p => p.id === selectedPlanId)) return;
+    setSelectedPlanId(draftPlanIndex.length > 0 ? draftPlanIndex[0].id : null);
+  }, [selectedVersionId, planIndex, indexLoading, isFinalContext, finalTargetName, planningMode, focusEpicKey, draftPlanIndex, selectedPlanId, createPlan]);
+
+  // Final mode always writes due dates back to Jira — no opt-out.
+  useEffect(() => { if (isFinalContext) setUpdateDueDates(true); }, [isFinalContext]);
 
   // Reset initialLoadRef when plan changes (new plan loaded)
   useEffect(() => { initialLoadRef.current = false; }, [selectedPlanId]);
@@ -787,6 +1191,35 @@ export default function VersionPlanningView({ projectKeys }) {
     return function() { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [plan, selectedVersionId]);
 
+  // estSource/bugFixPct/bufferDays/autoDepByDev/codeFreezeDays/stabilizationDays used to be
+  // plain component state with hardcoded defaults and were never persisted — every reload or
+  // plan switch silently reset them, which read as "settings aren't being saved." They're now
+  // read from (and written into) plan.settings, riding the existing autosave above. On a plan
+  // switch, load them back out of the freshly-fetched plan once (not on every plan mutation,
+  // or a user's own edit would immediately get overwritten by a stale closure).
+  useEffect(() => {
+    if (!selectedPlanId || planLoading) return;
+    if (settingsSyncedForPlanRef.current === selectedPlanId) return;
+    const s = plan.settings || {};
+    setEstSource(s.estSource || 'rough');
+    setBugFixPct(typeof s.bugFixPct === 'number' ? s.bugFixPct : 20);
+    setBufferDays(typeof s.bufferDays === 'number' ? s.bufferDays : 0);
+    setAutoDepByDev(typeof s.autoDepByDev === 'boolean' ? s.autoDepByDev : true);
+    setCodeFreezeDays(typeof s.codeFreezeDays === 'number' ? s.codeFreezeDays : 5);
+    setStabilizationDays(typeof s.stabilizationDays === 'number' ? s.stabilizationDays : 10);
+    settingsSyncedForPlanRef.current = selectedPlanId;
+    skipNextSettingsWriteRef.current = true;
+  }, [selectedPlanId, planLoading, plan.settings]);
+
+  useEffect(() => {
+    if (skipNextSettingsWriteRef.current) { skipNextSettingsWriteRef.current = false; return; }
+    if (!selectedPlanId || settingsSyncedForPlanRef.current !== selectedPlanId) return;
+    updatePlan(prev => ({
+      ...prev,
+      settings: { ...prev.settings, estSource, bugFixPct, bufferDays, autoDepByDev, codeFreezeDays, stabilizationDays },
+    }));
+  }, [estSource, bugFixPct, bufferDays, autoDepByDev, codeFreezeDays, stabilizationDays]);
+
   // Build rough estimate map and missing-estimate map using module-level functions
   const roughMap = useMemo(
     () => Object.assign(
@@ -798,8 +1231,68 @@ export default function VersionPlanningView({ projectKeys }) {
   );
 
   const missingEstMap = useMemo(
-    () => buildMissingEstMap(estSource, epicScopedHierarchy.epics, epicScopedHierarchy.storiesByEpic, epicScopedHierarchy.subtasksByStory, roughEstFieldId, roughMap),
-    [estSource, epicScopedHierarchy, roughEstFieldId, roughMap]
+    () => buildMissingEstMap(epicScopedHierarchy.epics, epicScopedHierarchy.storiesByEpic, epicScopedHierarchy.subtasksByStory, roughMap),
+    [epicScopedHierarchy, roughMap]
+  );
+
+  // Draft mode: an epic's REMAINING dev estimate (total minus already-dev-done children) —
+  // shown as its own column and used for scheduling duration instead of the full total, so
+  // dragging an epic that's mostly dev-done doesn't block the timeline for its full original
+  // size. schedMap is what every DURATION calculation should read from; it's identical to
+  // roughMap in Final/Epic Timeline modes (this feature only applies to Draft mode's
+  // epic-level scheduling) and for any non-epic row even within Draft mode.
+  const remainingEstMap = useMemo(
+    () => buildEpicRollupMap(epicScopedHierarchy.epics, epicScopedHierarchy.storiesByEpic, roughMap, isDevDoneStatus),
+    [epicScopedHierarchy, roughMap]
+  );
+  const schedMap = planningMode === 'draft' ? remainingEstMap : roughMap;
+
+  // Base hours for the QA/BUG-FIX BUFFER — excludes only genuinely Done children, so work
+  // that's dev-complete but still awaiting QA sign-off (In Review / Ready for Testing /
+  // Ready for Deployment) keeps its rework budget reserved. Must NOT use schedMap: that
+  // strips every dev-done child, which silently zeroed the bug-fix days for exactly the
+  // epics most likely to still generate bugs.
+  const bugFixBaseMap = useMemo(
+    () => buildBugFixBaseMap(epicScopedHierarchy.epics, epicScopedHierarchy.storiesByEpic, roughMap),
+    [epicScopedHierarchy, roughMap]
+  );
+  const qaBaseMap = planningMode === 'draft' ? bugFixBaseMap : roughMap;
+
+  // Dependency action feedback clears itself — it's a confirmation, not a persistent banner.
+  useEffect(() => {
+    if (!depNote) return;
+    const t = setTimeout(() => setDepNote(null), 6000);
+    return () => clearTimeout(t);
+  }, [depNote]);
+
+  // How many issues each dev is assigned to — shown next to their chip so it's obvious who
+  // is actually carrying work vs. who was auto-detected from Jira and can be pruned.
+  const assignedCountByDev = useMemo(() => {
+    const counts = {};
+    for (const e of Object.values(plan.issues || {})) {
+      for (const id of (e.assignedPlaceholders || [])) counts[id] = (counts[id] || 0) + 1;
+    }
+    return counts;
+  }, [plan.issues]);
+
+  // The RAW Rough Estimation field per issue, independent of the Estimate-source toggle and
+  // of every rollup/inheritance fallback — so the "Rough" column always shows the number
+  // actually stored in Jira (or the pending inline edit), making it possible to compare it
+  // against the Children Sum instead of only seeing whichever one estSource selected.
+  const rawRoughMap = useMemo(() => {
+    const m = {};
+    const all = [].concat(
+      epicScopedHierarchy.epics,
+      Object.values(epicScopedHierarchy.storiesByEpic).flat(),
+      Object.values(epicScopedHierarchy.subtasksByStory).flat()
+    );
+    all.forEach(i => { const v = ownEstHours(i, 'rough', roughEstFieldId); if (v > 0) m[i.key] = v; });
+    return Object.assign(m, localRoughEst);
+  }, [epicScopedHierarchy, roughEstFieldId, localRoughEst]);
+
+  const estCoverageMap = useMemo(
+    () => buildEstCoverageMap(epicScopedHierarchy.epics, epicScopedHierarchy.storiesByEpic, epicScopedHierarchy.subtasksByStory, estSource, roughEstFieldId),
+    [epicScopedHierarchy, estSource, roughEstFieldId]
   );
 
   // QA hours per issue (sourced from plan.issues[key].qaHours)
@@ -813,12 +1306,12 @@ export default function VersionPlanningView({ projectKeys }) {
 
   // Draft mode passes QA/bugfix context so cascadePlan uses effective end dates for dependency chaining
   const draftOpts = useMemo(() => {
-    if (planningMode === 'draft') return { qaMap, bugFixPct };
+    if (planningMode === 'draft') return { qaMap, bugFixPct, bugFixBaseMap: qaBaseMap };
     if (planningMode === 'epic') return { bufferDays };
     return {};
-  }, [planningMode, qaMap, bugFixPct, bufferDays]);
+  }, [planningMode, qaMap, bugFixPct, bufferDays, qaBaseMap]);
 
-  const computedPlan = useMemo(() => cascadePlan(plan, roughMap, draftOpts), [plan, roughMap, draftOpts]);
+  const computedPlan = useMemo(() => cascadePlan(plan, schedMap, draftOpts), [plan, schedMap, draftOpts]);
 
   // Epic Timeline mode: exclude container stories (their own stored dates are vestigial —
   // getBarProps always overrides them from their subtasks) from conflict detection, so a
@@ -833,7 +1326,7 @@ export default function VersionPlanningView({ projectKeys }) {
     return { ...draftOpts, excludeKeys: containerKeys, skipLockedPairs: true };
   }, [planningMode, draftOpts, storiesByEpic, subtasksByStory, focusEpicKey]);
 
-  const conflicts = useMemo(() => detectConflicts(computedPlan, roughMap, conflictOpts), [computedPlan, roughMap, conflictOpts]);
+  const conflicts = useMemo(() => detectConflicts(computedPlan, schedMap, conflictOpts), [computedPlan, schedMap, conflictOpts]);
 
   const conflictingKeys = useMemo(function() {
     var s = new Set();
@@ -843,26 +1336,11 @@ export default function VersionPlanningView({ projectKeys }) {
 
   // Critical path keys — placed after conflictingKeys to avoid TDZ
   const criticalPathKeys = useMemo(function() {
-    return new Set(computeCriticalPath(computedPlan, roughMap));
-  }, [computedPlan, roughMap]);
+    return new Set(computeCriticalPath(computedPlan, schedMap));
+  }, [computedPlan, schedMap]);
 
-  // Overlap detection — placed AFTER conflicts/conflictingKeys to avoid TDZ on [conflicts]
-  useEffect(function() {
-    var currentKeys = new Set(conflicts.map(function(c) { return c.source + '->' + c.target; }));
-    var newConflicts = conflicts.filter(function(c) { return !prevConflictKeysRef.current.has(c.source + '->' + c.target); });
-    if (newConflicts.length > 0) {
-      setOverlapAlert({ conflicts: newConflicts });
-      var t = setTimeout(function() { setOverlapAlert(null); }, 5000);
-      prevConflictKeysRef.current = currentKeys;
-      return function() { clearTimeout(t); };
-    }
-    prevConflictKeysRef.current = currentKeys;
-  }, [conflicts]);
 
   const rows = useMemo(() => {
-    if (planningMode === 'draft') {
-      return epics.map(epic => ({ ...epic, _isEpic: true }));
-    }
     if (planningMode === 'epic') {
       const epic = epics.find(e => e.key === focusEpicKey);
       if (!epic) return [];
@@ -877,12 +1355,17 @@ export default function VersionPlanningView({ projectKeys }) {
       }
       return result;
     }
+    // Draft AND Final both list epics with their child stories under an expandable caret.
+    // They differ in how each SAVES (Draft keeps many named plans, Final is one committed
+    // plan written straight to Jira) and in what the epic's own bar means (Draft schedules at
+    // epic level with QA/Fix extensions; Final derives a summary bar from its placed stories)
+    // — not in the row hierarchy, so the same shape is built for both.
     const result = [];
     for (const epic of epics) {
       result.push({ ...epic, _isEpic: true });
       if (expandedEpics.has(epic.key)) {
         for (const story of (storiesByEpic[epic.key] || [])) {
-          result.push({ ...story, _isEpic: false });
+          result.push({ ...story, _isEpic: false, _isStory: true });
         }
       }
     }
@@ -935,6 +1418,34 @@ export default function VersionPlanningView({ projectKeys }) {
     }
   }, [planningMode, focusEpicKey, storiesByEpic, subtasksByStory, plan.issues]);
 
+  // Draft mode: an epic's dev roster is the UNION of its own Jira assignee and every
+  // assignee across its child stories — since an epic is scheduled as one block here, all
+  // the people actually working on it should show as its assigned devs (and their combined
+  // capacity then drives its duration). Only fills in epics with nothing assigned yet, so a
+  // manual assignment is never overridden. Ignored-status children don't contribute.
+  useEffect(() => {
+    if (planningMode !== 'draft') return;
+    for (const epic of epics) {
+      const epicEntry = plan.issues[epic.key];
+      if (epicEntry && (epicEntry.assignedPlaceholders || []).length) continue;
+      const accounts = new Map(); // accountId → displayName (dedupes an assignee on several children)
+      const epicAssignee = epic.fields?.assignee;
+      if (epicAssignee?.accountId) accounts.set(epicAssignee.accountId, epicAssignee.displayName);
+      for (const story of (storiesByEpic[epic.key] || [])) {
+        if (isIgnoredStatus(story)) continue;
+        const a = story.fields?.assignee;
+        if (a?.accountId) accounts.set(a.accountId, a.displayName);
+      }
+      if (!accounts.size) continue;
+      const phIds = [];
+      for (const [accountId, displayName] of accounts) {
+        const phId = ensurePlaceholderForAssignee(accountId, displayName);
+        if (phId) phIds.push(phId);
+      }
+      if (phIds.length) updateIssueEntry(epic.key, { assignedPlaceholders: phIds });
+    }
+  }, [planningMode, epics, storiesByEpic, plan.issues]);
+
   // Epic Timeline mode: issues that have moved past "not started" (anything other than
   // Reopened/To Do/Blocked, and not Known Issue/Removed which are ignored entirely) get
   // their timeline auto-derived from real Jira status history instead of a rough-estimate
@@ -977,14 +1488,16 @@ export default function VersionPlanningView({ projectKeys }) {
   const sortedRows = useMemo(() => {
     if (!sortCol) return filteredRows;
     function cmp(a, b) {
-      var va = getSortValue(a, sortCol, roughMap, computedPlan);
-      var vb = getSortValue(b, sortCol, roughMap, computedPlan);
+      var va = getSortValue(a, sortCol, roughMap, schedMap, computedPlan, rawRoughMap);
+      var vb = getSortValue(b, sortCol, roughMap, schedMap, computedPlan, rawRoughMap);
       var result = (typeof va === 'string' || typeof vb === 'string')
         ? String(va).localeCompare(String(vb))
         : va - vb;
       return sortDir === 'asc' ? result : -result;
     }
-    if (planningMode === 'draft') return [...filteredRows].sort(cmp);
+    // Draft used to be a flat epics-only list and could sort flat; now that it carries child
+    // stories it must use the same epic-grouped sort as Final, or sorting would interleave
+    // stories with unrelated epics and destroy the hierarchy.
     if (planningMode === 'epic') {
       if (filteredRows.length === 0) return filteredRows;
       var epicRow = filteredRows[0];
@@ -1018,7 +1531,7 @@ export default function VersionPlanningView({ projectKeys }) {
       out.push.apply(out, g.children);
     });
     return out;
-  }, [filteredRows, sortCol, sortDir, roughMap, computedPlan, planningMode]);
+  }, [filteredRows, sortCol, sortDir, roughMap, schedMap, rawRoughMap, computedPlan, planningMode]);
 
   function handleSort(col) {
     if (sortCol === col) {
@@ -1034,8 +1547,8 @@ export default function VersionPlanningView({ projectKeys }) {
     return <span style={{ marginLeft: 3, fontSize: 8 }}>{sortDir === 'asc' ? '▲' : '▼'}</span>;
   }
 
-  const totalLeftWidth = colWidths.key + colWidths.summary + colWidths.est + colWidths.assigned
-    + (planningMode === 'draft' ? colWidths.qa : 0) + colWidths.days;
+  const totalLeftWidth = colWidths.key + colWidths.summary + colWidths.est + colWidths.rough + colWidths.assigned
+    + (planningMode === 'draft' ? colWidths.qa + colWidths.remaining : 0) + colWidths.days;
 
   // The window must also reach backward to cover any issue already dated before planStart
   // (e.g. real Jira status-history dates for work that started in the past) — otherwise
@@ -1081,14 +1594,14 @@ export default function VersionPlanningView({ projectKeys }) {
         const ei = workingDays.indexOf(snapToWorkingDay(entry.actualEndDate));
         if (ei > startIdx) endIdx = ei;
       } else {
-        const devs = (entry.assignedPlaceholders || []).length || 1;
-        endIdx = startIdx + calcDays(roughMap[row.key], devs) - 1;
+        const devs = effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders);
+        endIdx = startIdx + calcDays(schedMap[row.key], devs) - 1;
       }
       if (startIdx < minIdx) minIdx = startIdx;
       if (endIdx > maxIdx) maxIdx = endIdx;
     }
     return maxIdx >= minIdx ? { minIdx, maxIdx } : null;
-  }, [rows, computedPlan.issues, roughMap, workingDays]);
+  }, [rows, computedPlan.issues, schedMap, workingDays]);
 
   // Auto-zoom: shrink day width so the whole scheduled span fits the panel without
   // horizontal scrolling. Never grows past BASE_DAY_WIDTH, never shrinks past MIN_DAY_WIDTH.
@@ -1108,15 +1621,15 @@ export default function VersionPlanningView({ projectKeys }) {
     let latest = null;
     for (const [key, entry] of Object.entries(computedPlan.issues || {})) {
       if (!entry.startDate) continue;
-      const devs = (entry.assignedPlaceholders || []).length || 1;
-      const devEnd = calcEndDate(entry.startDate, roughMap[key], devs);
+      const devs = effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders);
+      const devEnd = calcEndDate(entry.startDate, schedMap[key], devs);
       if (!devEnd) continue;
-      const { totalExtra } = calcQaBugFixDays(roughMap[key], devs, qaMap[key] || 0, bugFixPct);
+      const { totalExtra } = calcQaBugFixDays(qaBaseMap[key], devs, qaMap[key] || 0, bugFixPct);
       const effEnd = totalExtra > 0 ? addWorkingDays(devEnd, totalExtra) : devEnd;
       if (!latest || effEnd > latest) latest = effEnd;
     }
     return latest;
-  }, [planningMode, computedPlan.issues, roughMap, qaMap, bugFixPct]);
+  }, [planningMode, computedPlan.issues, schedMap, qaMap, bugFixPct]);
 
   const codeFreezeDate = useMemo(() => {
     if (!lastEffectiveEnd || !codeFreezeDays) return null;
@@ -1144,7 +1657,7 @@ export default function VersionPlanningView({ projectKeys }) {
     if (planningMode !== 'epic' || !focusEpicKey) return [];
     function buildRow(issue, type, parentKey) {
       const entry = computedPlan.issues?.[issue.key] || {};
-      const devs = (entry.assignedPlaceholders || []).length || 1;
+      const devs = effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders);
       const assignedDevNames = (entry.assignedPlaceholders || []).map(id => phMap[id]?.name).filter(Boolean).join(', ');
       let endDate = '';
       if (entry.actualEndDate) endDate = entry.actualEndDate;
@@ -1488,7 +2001,150 @@ export default function VersionPlanningView({ projectKeys }) {
     URL.revokeObjectURL(url);
   }
 
+  // Full structured dump of the current plan — dates, assignees, capacities, estimates,
+  // conflicts, everything the app itself knows — as JSON. Unlike exportTimelineHtml (Epic
+  // Timeline mode only, one epic, styled for reading), this works in every mode and is meant
+  // to be handed to someone (or something) else for analysis, e.g. a dashboard built from it,
+  // or to paste back into a conversation for debugging a number that looks wrong on screen.
+  function exportPlanJson() {
+    const ver = versions.find(v => v.id === selectedVersionId);
+    const devUtils = computeDevUtilization(computedPlan, roughMap);
+    const span = computeProjectSpan(computedPlan, roughMap);
+    const critPath = computeCriticalPath(computedPlan, roughMap);
+    const totalDays = workingDaysBetween(span.start, span.end);
+
+    // Every epic + story in the current version, regardless of what's currently expanded/
+    // scrolled into view in the UI — the export is meant to be complete, not a screenshot of
+    // whatever happens to be on screen right now. Subtasks only when in Epic Timeline mode,
+    // where they're independently schedulable; Draft/Final plan at the story level or above.
+    const allIssues = [];
+    epics.forEach(e => allIssues.push({ ...e, _type: 'Epic' }));
+    Object.values(storiesByEpic).flat().forEach(s => allIssues.push({ ...s, _type: 'Story' }));
+    if (planningMode === 'epic') {
+      Object.values(subtasksByStory).flat().forEach(st => allIssues.push({ ...st, _type: 'Subtask' }));
+    }
+
+    const developers = (plan.placeholders || []).map(ph => {
+      const capacityPct = typeof ph.capacityPct === 'number' ? ph.capacityPct : 100;
+      const hoursAssigned = devUtils[ph.id] || 0;
+      // Same "capacity-adjusted cap" math as the Summary panel's utilization bars — a dev at
+      // 50% capacity has HALF the working hours to compare their assigned hours against, so
+      // their bar (and this ratio) reads as more heavily loaded for the same hour count.
+      const capacityHours = totalDays > 0 ? totalDays * HOURS_PER_DAY * (capacityPct / 100) : null;
+      return {
+        id: ph.id,
+        name: ph.name,
+        accountId: ph.accountId || null,
+        capacityPct,
+        hoursAssigned: Number(hoursAssigned.toFixed(2)),
+        capacityHoursOverPlanSpan: capacityHours != null ? Number(capacityHours.toFixed(2)) : null,
+        utilizationPct: capacityHours ? Number(((hoursAssigned / capacityHours) * 100).toFixed(1)) : null,
+        assignedIssueCount: Object.values(computedPlan.issues || {}).filter(e => (e.assignedPlaceholders || []).includes(ph.id)).length,
+      };
+    });
+
+    const issues = allIssues.map(issue => {
+      const entry = computedPlan.issues?.[issue.key] || {};
+      const assignedDevIds = entry.assignedPlaceholders || [];
+      const devs = effectiveDevCount(assignedDevIds, computedPlan.placeholders);
+      const endDate = entry.actualEndDate || (entry.startDate ? calcEndDate(entry.startDate, schedMap[issue.key], devs) : null);
+      return {
+        key: issue.key,
+        type: issue._type,
+        summary: issue.fields?.summary || '',
+        status: issue.fields?.status?.name || '',
+        parentKey: issue.fields?.parent?.key || null,
+        jiraAssignee: issue.fields?.assignee?.displayName || null,
+        assignedDevs: assignedDevIds.map(id => phMap[id]?.name).filter(Boolean),
+        assignedDevCapacityPct: assignedDevIds.map(id => (phMap[id] && typeof phMap[id].capacityPct === 'number') ? phMap[id].capacityPct : 100),
+        startDate: entry.startDate || null,
+        endDate: endDate || null,
+        totalEstimateHours: roughMap[issue.key] ?? null,
+        remainingEstimateHours: remainingEstMap[issue.key] ?? null,
+        qaHours: entry.qaHours || 0,
+        dependencies: entry.dependencies || [],
+        jiraLocked: !!entry.jiraLocked,
+        actualEndDateFromJira: entry.actualEndDate || null,
+        historyResolved: !!entry.historyResolved,
+        borrowedDevFromParent: !!entry.borrowedFromParent,
+      };
+    });
+
+    const data = {
+      exportedAt: new Date().toISOString(),
+      app: 'planJira (K1-Planner)',
+      planningMode,
+      project: { keys: projectKeys, versionId: selectedVersionId, versionName: ver ? `${ver.projectKey} · ${ver.name}` : null },
+      plan: { id: selectedPlanId, name: planIndex.find(p => p.id === selectedPlanId)?.name || null },
+      settings: {
+        estSource, bugFixPct, codeFreezeDays, stabilizationDays,
+        bufferDays: planningMode === 'epic' ? bufferDays : undefined,
+        autoDepByDev: planningMode === 'draft' ? autoDepByDev : undefined,
+      },
+      developers,
+      issues,
+      milestones: computedPlan.milestones || [],
+      sprints,
+      summary: {
+        projectSpanStart: span.start,
+        projectSpanEnd: span.end,
+        projectSpanWorkingDays: totalDays,
+        criticalPath: critPath,
+        conflicts: conflicts.map(c => ({ developer: c.placeholder.name, source: c.source, target: c.target })),
+        missingEstimateIssueCount: Object.keys(missingEstMap).length,
+      },
+    };
+
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `planJira-${planningMode}-${(planIndex.find(p => p.id === selectedPlanId)?.name || 'plan').replace(/[^\w-]+/g, '_')}-${TODAY_STR}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   function getBarProps(issueKey) {
+    // Draft mode: an epic with ANY child story locked to real Jira dates is itself shown
+    // locked — grey, 🔒, spanning the earliest locked child's start to the latest locked
+    // child's end — so a committed date discovered at the story level is never hidden behind
+    // the epic's own estimate-based placement. This overrides the epic's own stored
+    // startDate the same way an Epic Timeline container overrides its own subtasks' parent;
+    // clicking the epic's 🔒 bulk-unlocks every locked child (see the render code) rather
+    // than trying to "unlock" a date the epic doesn't actually own.
+    if (planningMode === 'draft') {
+      const childStories = storiesByEpic[issueKey];
+      if (childStories && childStories.length > 0) {
+        const lockedChildren = childStories.filter(s => computedPlan.issues?.[s.key]?.jiraLocked);
+        if (lockedChildren.length > 0) {
+          let minStart = null, maxEnd = null;
+          lockedChildren.forEach(s => {
+            const e = computedPlan.issues[s.key];
+            if (!e?.startDate) return;
+            if (!minStart || e.startDate < minStart) minStart = e.startDate;
+            const end = e.actualEndDate || e.startDate;
+            if (!maxEnd || end > maxEnd) maxEnd = end;
+          });
+          const startIdx = minStart ? workingDays.indexOf(snapToWorkingDay(minStart)) : -1;
+          if (startIdx >= 0) {
+            const endIdx = maxEnd ? workingDays.indexOf(snapToWorkingDay(maxEnd)) : startIdx;
+            const durationDays = Math.max(1, (endIdx >= startIdx ? endIdx : startIdx) - startIdx + 1);
+            return {
+              left: startIdx * DAY_WIDTH,
+              width: durationDays * DAY_WIDTH - 2,
+              durationDays,
+              startDate: minStart,
+              endDate: maxEnd || minStart,
+              jiraLocked: true,
+              lockedChildKeys: lockedChildren.map(s => s.key),
+            };
+          }
+        }
+      }
+    }
     // Epic Timeline mode: a story with subtasks is a container, not independently-booked
     // work — it must always start/end exactly with its children, regardless of its own
     // startDate/history/manual placement, so the parent never drifts out of sync.
@@ -1527,8 +2183,8 @@ export default function VersionPlanningView({ projectKeys }) {
         isActual: true,
       };
     }
-    const devs = (entry.assignedPlaceholders || []).length || 1;
-    const hours = roughMap[issueKey];
+    const devs = effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders);
+    const hours = schedMap[issueKey];
     const durationDays = calcDays(hours, devs);
     return {
       left: startIdx * DAY_WIDTH,
@@ -1578,7 +2234,7 @@ export default function VersionPlanningView({ projectKeys }) {
           if (phId) { phs = [phId]; borrowed = !ownAssignee; }
         }
       }
-      const devs = phs.length || 1;
+      const devs = effectiveDevCount(phs, plan.placeholders);
       updateIssueEntry(sub.key, { startDate: cursor, assignedPlaceholders: phs, dependencies: prevKey ? [prevKey] : [], borrowedFromParent: borrowed });
       const endDate = calcEndDate(cursor, roughMap[sub.key], devs);
       if (endDate) cursor = addWorkingDays(endDate, 1 + bufferDays);
@@ -1596,11 +2252,59 @@ export default function VersionPlanningView({ projectKeys }) {
     // which it does by always clearing dependencies/actualEndDate and setting
     // historyResolved so neither that effect nor a future Auto-schedule run silently
     // reverts this choice.
+    // An issue that already carries a committed Due date in Jira is already scheduled —
+    // dropping it honors that date rather than the cursor position, and locks the bar
+    // (grey + 🔒) so a stray drag can't silently contradict Jira. With a Start date custom
+    // field too, both ends are real; with only a Due date, the start is derived by counting
+    // the issue's estimated duration backward from it, so the work finishes exactly on its
+    // commitment. Click the 🔒 to unlock; `jiraUnlocked` then persists that choice so it
+    // won't re-lock on the next drop.
+    const issueForWindow = issueByKey[issueKey];
+    const devsForWindow = effectiveDevCount(plan.issues?.[issueKey]?.assignedPlaceholders, plan.placeholders);
+    const durationForWindow = calcDays(schedMap[issueKey], devsForWindow);
+    const jiraWin = jiraDateWindow(issueForWindow, startDateFieldId, durationForWindow);
+    const entryNow = plan.issues?.[issueKey];
+    if (jiraWin && !entryNow?.jiraUnlocked) {
+      updateIssueEntry(issueKey, {
+        startDate: jiraWin.start, actualEndDate: jiraWin.end,
+        dependencies: [], historyResolved: true, jiraLocked: true,
+      });
+      setDepNote(jiraWin.derivedStart
+        ? `${issueKey} has a Jira Due date (${jiraWin.end}) — placed to finish there (start derived from its estimate) and locked. Click its 🔒 to unlock.`
+        : `${issueKey} has Jira Start/Due dates (${jiraWin.start} → ${jiraWin.end}) — placed there and locked. Click its 🔒 to unlock and move it freely.`);
+      return;
+    }
     if (planningMode === 'epic' && (subtasksByStory[issueKey] || []).length > 0) {
       placeStoryAndSubtasks(issueKey, day);
       return;
     }
-    updateIssueEntry(issueKey, { startDate: day, dependencies: [], actualEndDate: undefined, historyResolved: true });
+    // Draft mode + "Auto-dep by dev": dropping an epic next to another one that shares a
+    // developer chains it behind that epic instead of leaving them to overlap — one person
+    // can't work two epics at once. The chosen predecessor is the LATEST-ENDING already-placed
+    // epic that shares a dev and starts at/before the drop point, so the drop position still
+    // decides WHERE in that dev's queue this lands. cascadePlan then owns the exact date (it
+    // always recomputes startDate from dependencies), so the bar snaps to just after that
+    // predecessor rather than sitting exactly where the cursor was released.
+    const autoDeps = autoDepOnDrop(issueKey, day);
+    updateIssueEntry(issueKey, { startDate: day, dependencies: autoDeps, actualEndDate: undefined, historyResolved: true });
+  }
+
+  // Returns the dependency list a freshly-dropped issue should get — [] unless Draft mode's
+  // auto-dependency-by-developer setting is on and a shared-dev predecessor exists.
+  function autoDepOnDrop(issueKey, day) {
+    if (planningMode !== 'draft' || !autoDepByDev) return [];
+    const phs = plan.issues?.[issueKey]?.assignedPlaceholders || [];
+    if (!phs.length) return [];
+    let best = null, bestEnd = null;
+    for (const [key, e] of Object.entries(computedPlan.issues || {})) {
+      if (key === issueKey || !e.startDate) continue;
+      if (e.startDate > day) continue; // sits after the drop point — don't chain behind it
+      if (!(e.assignedPlaceholders || []).some(id => phs.includes(id))) continue;
+      const devs = effectiveDevCount(e.assignedPlaceholders, computedPlan.placeholders);
+      const end = e.actualEndDate || calcEndDate(e.startDate, schedMap[key], devs) || e.startDate;
+      if (!bestEnd || end > bestEnd) { best = key; bestEnd = end; }
+    }
+    return best ? [best] : [];
   }
 
   function handleTimelineClick(issueKey, dayIdx) {
@@ -1610,10 +2314,64 @@ export default function VersionPlanningView({ projectKeys }) {
     placeOnTimeline(issueKey, day);
   }
 
+  // Releases a bar pinned to Jira's own Start/Due dates. Keeps the current start (so it
+  // doesn't jump on unlock) but drops the fixed end so its duration reverts to the
+  // estimate-based one, and records `jiraUnlocked` so future drops respect the cursor
+  // instead of snapping back to Jira's dates.
+  function unlockJiraDates(issueKey) {
+    updateIssueEntry(issueKey, { jiraLocked: false, jiraUnlocked: true, actualEndDate: undefined });
+    setDepNote(`${issueKey} unlocked from its Jira dates — you can drag it anywhere now.`);
+  }
+
+  // For an epic whose bar is shown locked because one or more of its child stories are —
+  // there's no date on the epic itself to unlock, so this unlocks every locked child instead.
+  function unlockAllChildren(childKeys) {
+    childKeys.forEach(unlockJiraDates);
+    setDepNote(`Unlocked ${childKeys.length} stor${childKeys.length === 1 ? 'y' : 'ies'} — the epic will return to its own estimate-based schedule.`);
+  }
+
   function removeDependency(sourceKey, targetKey) {
     const e = computedPlan.issues?.[targetKey];
     if (!e) return;
     updateIssueEntry(targetKey, { dependencies: (e.dependencies || []).filter(d => d !== sourceKey) });
+  }
+
+  // Flips a dependency's direction: the issue that was waiting becomes the predecessor.
+  // For when something was dropped after another epic but actually has to precede it —
+  // otherwise the only route was "click the arrow to delete, then redraw it by hand in
+  // dependency mode", which auto-chaining tends to undo on the next drop.
+  // Both sides are rewritten in ONE updatePlan call so cascadePlan never observes an
+  // intermediate state where the edge exists in both directions.
+  // Refuses when the flip would create a cycle: cascadePlan topologically sorts, and a
+  // cycle silently drops every issue in it from scheduling (its queue never drains).
+  function reverseDependency(sourceKey, targetKey) {
+    const issues = computedPlan.issues || {};
+    // After the flip, sourceKey depends on targetKey. Walk targetKey's remaining dependency
+    // chain (ignoring the edge being removed) — if it leads back to sourceKey, that's a cycle.
+    const seen = new Set();
+    const stack = [targetKey];
+    while (stack.length) {
+      const k = stack.pop();
+      if (k === sourceKey) {
+        setDepNote(`Can't reverse ${sourceKey} → ${targetKey}: ${targetKey} already depends on ${sourceKey} through another chain, so flipping it would create a loop.`);
+        return;
+      }
+      if (seen.has(k)) continue;
+      seen.add(k);
+      for (const d of (issues[k]?.dependencies || [])) {
+        if (k === targetKey && d === sourceKey) continue; // the edge we're about to remove
+        stack.push(d);
+      }
+    }
+    updatePlan(prev => {
+      const next = { ...(prev.issues || {}) };
+      const t = next[targetKey];
+      if (t) next[targetKey] = { ...t, dependencies: (t.dependencies || []).filter(d => d !== sourceKey) };
+      const s = next[sourceKey] || { startDate: null, assignedPlaceholders: [], dependencies: [] };
+      next[sourceKey] = { ...s, dependencies: [...new Set([...(s.dependencies || []), targetKey])] };
+      return { ...prev, issues: next };
+    });
+    setDepNote(`Reversed: ${targetKey} now runs before ${sourceKey}.`);
   }
 
   function togglePlaceholder(issueKey, phId) {
@@ -1651,7 +2409,14 @@ export default function VersionPlanningView({ projectKeys }) {
 
     if (planningMode !== 'epic') {
       // Draft/Final modes — original behavior: rows order, no status filtering.
-      const candidates = rows.filter(row => !newIssues[row.key]?.startDate);
+      // Draft schedules at EPIC level (that's the mode's whole premise: duration = rough est
+      // ÷ devs, with QA/Fix extensions on the epic's own bar), so its newly-visible child
+      // story rows are context for reading the epic's numbers — not extra work to place.
+      // Without this filter, expanding an epic would start double-booking its devs against
+      // both the epic and its own stories.
+      const candidates = rows.filter(row =>
+        !newIssues[row.key]?.startDate && (planningMode !== 'draft' || row._isEpic)
+      );
       const nextAvail = {}; // phId → next available date
       for (const row of candidates) {
         const entry = newIssues[row.key] || { startDate: null, assignedPlaceholders: [], dependencies: [] };
@@ -1664,13 +2429,13 @@ export default function VersionPlanningView({ projectKeys }) {
         for (const depKey of (entry.dependencies || [])) {
           const de = newIssues[depKey];
           if (de?.startDate) {
-            const devs = (de.assignedPlaceholders || []).length || 1;
-            const depEnd = calcEndDate(de.startDate, roughMap[depKey], devs);
+            const devs = effectiveDevCount(de.assignedPlaceholders, plan.placeholders);
+            const depEnd = calcEndDate(de.startDate, schedMap[depKey], devs);
             if (depEnd) { const after = nextWorkDay(depEnd); if (after > start) start = after; }
           }
         }
-        const devs = phs.length || 1;
-        const endDate = calcEndDate(start, roughMap[row.key], devs);
+        const devs = effectiveDevCount(phs, plan.placeholders);
+        const endDate = calcEndDate(start, schedMap[row.key], devs);
         newIssues[row.key] = { ...entry, startDate: start };
         for (const phId of phs) { if (endDate) nextAvail[phId] = nextWorkDay(endDate); }
       }
@@ -1767,7 +2532,7 @@ export default function VersionPlanningView({ projectKeys }) {
     for (const row of leaves) {
       const e = newIssues[row.key];
       if (!e?.startDate) continue;
-      const devs = (e.assignedPlaceholders || []).length || 1;
+      const devs = effectiveDevCount(e.assignedPlaceholders, plan.placeholders);
       const end = e.actualEndDate || calcEndDate(e.startDate, roughMap[row.key], devs);
       if (!end) continue;
       const after = addWorkingDays(end, 1 + bufferDays);
@@ -1815,13 +2580,13 @@ export default function VersionPlanningView({ projectKeys }) {
       for (const depKey of deps) {
         const de = newIssues[depKey];
         if (de?.startDate) {
-          const devs = (de.assignedPlaceholders || []).length || 1;
+          const devs = effectiveDevCount(de.assignedPlaceholders, plan.placeholders);
           // A locked dependency's real end date is a fact — never replace it with an estimate.
           const depEnd = de.actualEndDate || calcEndDate(de.startDate, roughMap[depKey], devs);
           if (depEnd) { const after = addWorkingDays(depEnd, 1 + bufferDays); if (after > start) start = after; }
         }
       }
-      const devs = phs.length || 1;
+      const devs = effectiveDevCount(phs, plan.placeholders);
       const endDate = calcEndDate(start, roughMap[row.key], devs);
       newIssues[row.key] = { ...entry, startDate: start, dependencies: deps };
       if (phs.length) {
@@ -1875,7 +2640,10 @@ export default function VersionPlanningView({ projectKeys }) {
   // but keeps the developer roster and milestones intact. In Epic Timeline mode this is
   // scoped to the focused epic's stories+subtasks (and their changelog cache, so the
   // status-driven auto-timeline can re-derive fresh dates); Draft/Final clear all visible rows.
-  function clearAllScheduling() {
+  // removeJiraDueDates — when true, also PUTs a null due date to Jira for every issue that
+  // was actually scheduled (had a startDate), undoing whatever a prior "Save to Jira" wrote.
+  // This talks to real Jira issues, so the caller must have gotten explicit confirmation first.
+  async function clearAllScheduling(removeJiraDueDates) {
     let keys;
     if (planningMode === 'epic') {
       keys = [];
@@ -1887,6 +2655,7 @@ export default function VersionPlanningView({ projectKeys }) {
       keys = rows.map(r => r.key);
     }
     const newIssues = { ...(plan.issues || {}) };
+    const keysToUnschedule = keys.filter(key => newIssues[key]?.startDate);
     for (const key of keys) {
       if (!newIssues[key]) continue;
       newIssues[key] = { ...newIssues[key], startDate: null, dependencies: [], actualEndDate: undefined, historyResolved: false };
@@ -1899,6 +2668,9 @@ export default function VersionPlanningView({ projectKeys }) {
         return next;
       });
     }
+    if (removeJiraDueDates && keysToUnschedule.length > 0) {
+      await Promise.all(keysToUnschedule.map(key => updateIssueDueDate(key, null).catch(() => {})));
+    }
   }
 
   async function handleSave() {
@@ -1909,8 +2681,8 @@ export default function VersionPlanningView({ projectKeys }) {
       if (updateDueDates) {
         for (const [key, entry] of Object.entries(planToSave.issues || {})) {
           if (!entry.startDate) continue;
-          const devs = (entry.assignedPlaceholders || []).length || 1;
-          const endDate = calcEndDate(entry.startDate, roughMap[key], devs);
+          const devs = effectiveDevCount(entry.assignedPlaceholders, planToSave.placeholders);
+          const endDate = calcEndDate(entry.startDate, schedMap[key], devs);
           if (endDate) await updateIssueDueDate(key, endDate);
         }
       }
@@ -1946,7 +2718,7 @@ export default function VersionPlanningView({ projectKeys }) {
         <select onChange={e => setSelectedVersionId(e.target.value || null)}
           style={{ padding: '8px 12px', fontSize: 13, border: '2px solid #DFE1E6', borderRadius: 6, minWidth: 240 }}>
           <option value="">— Choose a version —</option>
-          {versions.filter(v => !v.released && !v.archived).map(v => <option key={v.id} value={v.id}>{v.projectKey} · {v.name}</option>)}
+          {selectableVersions.map(v => <option key={v.id} value={v.id}>{v.projectKey} · {v.name}</option>)}
         </select>
         {issuesLoading && <div style={{ marginTop: 12, color: '#97A0AF', fontSize: 12 }}>Loading versions…</div>}
       </div>
@@ -1963,36 +2735,38 @@ export default function VersionPlanningView({ projectKeys }) {
       overflow: 'hidden', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 180px)',
     }}>
 
-      {/* ── Top toolbar ── */}
+      {/* ── Top toolbar — minimum required controls only; everything else lives in the
+          right-hand side panel (opened via the buttons in the second row below) ── */}
       <div style={{ padding: '10px 16px', borderBottom: '1px solid #DFE1E6', background: '#FAFBFC', flexShrink: 0 }}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           {/* Version selector */}
           <select value={selectedVersionId || ''} onChange={e => { setSelectedVersionId(e.target.value || null); setSelectedPlanId(null); }}
             style={{ padding: '5px 10px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, fontWeight: 600 }}>
             <option value="">— Choose version —</option>
-            {versions.filter(v => !v.released && !v.archived).map(v => <option key={v.id} value={v.id}>{v.projectKey} · {v.name}</option>)}
+            {selectableVersions.map(v => <option key={v.id} value={v.id}>{v.projectKey} · {v.name}</option>)}
           </select>
 
-          {/* Plan selector */}
-          {selectedVersionId && (
+          {/* Plan selector — Draft only. Final is a single reserved plan with no picker. */}
+          {selectedVersionId && !isFinalContext && (
             <>
               <span style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600 }}>Plan:</span>
               <select value={selectedPlanId || ''} onChange={e => { if (e.target.value) setSelectedPlanId(e.target.value); }}
                 style={{ padding: '4px 10px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, minWidth: 120 }}>
-                {planIndex.length === 0 && <option value="">No plans yet</option>}
-                {planIndex.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                {draftPlanIndex.length === 0 && <option value="">No plans yet</option>}
+                {draftPlanIndex.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
-              <button onClick={() => setPlanDialog({ type: 'new', defaultName: 'Plan ' + (planIndex.length + 1) })}
-                style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>+ New</button>
-              {selectedPlanId && (<>
-                <button onClick={() => setPlanDialog({ type: 'saveas', defaultName: (planIndex.find(p => p.id === selectedPlanId)?.name || '') + ' (copy)' })}
-                  style={btnStyle('#E9F2FF', '#0052CC', '#B3D4FF')}>Save as…</button>
-                <button onClick={() => setPlanDialog({ type: 'rename', planId: selectedPlanId, defaultName: planIndex.find(p => p.id === selectedPlanId)?.name || '' })}
-                  style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>Rename</button>
-                <button onClick={() => setPlanDialog({ type: 'delete', planId: selectedPlanId })}
-                  style={btnStyle('#FFEBE6', '#DE350B', '#FF8F73')}>Delete</button>
-              </>)}
+              <button onClick={() => {
+                const ver = versions.find(x => x.id === selectedVersionId);
+                const versionLabel = ver ? `${ver.projectKey} · ${ver.name}` : 'Draft';
+                const context = planningMode === 'epic' && focusEpicKey ? `${versionLabel} · ${focusEpicKey}` : versionLabel;
+                setPlanDialog({ type: 'new', defaultName: `${context} Draft ${draftPlanIndex.length + 1}` });
+              }} style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>+ New</button>
             </>
+          )}
+          {selectedVersionId && isFinalContext && (
+            <span style={{ fontSize: 11, color: '#0052CC', fontWeight: 600, background: '#E9F2FF', border: '1.5px solid #B3D4FF', borderRadius: 4, padding: '4px 10px' }}>
+              🔒 Final plan — saved directly to Jira
+            </span>
           )}
 
           {/* Planning mode toggle */}
@@ -2031,69 +2805,28 @@ export default function VersionPlanningView({ projectKeys }) {
             </select>
           )}
 
-          {/* Est source toggle — Final and Epic Timeline modes */}
-          {(planningMode === 'final' || planningMode === 'epic') && (
+          {/* Epic Timeline's own nested Draft/Final choice — separate from the top-level
+              toggle. Final here means "this one epic's committed schedule", saved straight
+              to Jira with no plan picker; Draft allows multiple named what-if schedules. */}
+          {planningMode === 'epic' && (
             <div style={{ display: 'flex', border: '1.5px solid #DFE1E6', borderRadius: 4, overflow: 'hidden' }}>
-              <button onClick={() => setEstSource('rough')} style={{
+              <button onClick={() => setEpicPlanKind('draft')} style={{
                 padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                background: estSource === 'rough' ? '#0052CC' : '#fff',
-                color: estSource === 'rough' ? '#fff' : '#42526E', border: 'none',
-              }} title="Use the Rough Estimation custom field">
-                Rough Est
+                background: epicPlanKind === 'draft' ? '#6554C0' : '#fff',
+                color: epicPlanKind === 'draft' ? '#fff' : '#42526E', border: 'none',
+              }} title="Draft: multiple named what-if schedules for this epic">
+                Draft
               </button>
-              <button onClick={() => setEstSource('children')} style={{
+              <button onClick={() => setEpicPlanKind('final')} style={{
                 padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                background: estSource === 'children' ? '#0052CC' : '#fff',
-                color: estSource === 'children' ? '#fff' : '#42526E',
+                background: epicPlanKind === 'final' ? '#0052CC' : '#fff',
+                color: epicPlanKind === 'final' ? '#fff' : '#42526E',
                 border: 'none', borderLeft: '1px solid #DFE1E6',
-              }} title="Sum children's (tasks/subtasks) original estimates">
-                Children Sum
+              }} title="Final: this epic's one committed schedule, saved directly to Jira">
+                Final
               </button>
             </div>
           )}
-
-          {/* Draft mode: QA/bugfix/freeze/stabilization settings */}
-          {planningMode === 'draft' && (
-            <>
-              <span style={{ fontSize: 11, color: '#97A0AF' }}>|</span>
-              <label style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600 }}>Bug fix:</label>
-              <input type="number" value={bugFixPct} min={0} max={100}
-                onChange={e => setBugFixPct(Math.max(0, Math.min(100, Number(e.target.value))))}
-                title="% of dev time developers spend fixing bugs after QA"
-                style={{ width: 42, padding: '3px 6px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
-              <span style={{ fontSize: 11, color: '#5E6C84' }}>%</span>
-              <label style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600, marginLeft: 4 }}>Freeze:</label>
-              <input type="number" value={codeFreezeDays} min={0}
-                onChange={e => setCodeFreezeDays(Math.max(0, Number(e.target.value)))}
-                title="Working days between last epic and code freeze"
-                style={{ width: 34, padding: '3px 6px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
-              <span style={{ fontSize: 11, color: '#5E6C84' }}>d</span>
-              <label style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600, marginLeft: 4 }}>Stab:</label>
-              <input type="number" value={stabilizationDays} min={0}
-                onChange={e => setStabilizationDays(Math.max(0, Number(e.target.value)))}
-                title="Working days of stabilization after code freeze"
-                style={{ width: 34, padding: '3px 6px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
-              <span style={{ fontSize: 11, color: '#5E6C84' }}>d</span>
-            </>
-          )}
-
-          {/* Epic Timeline mode: buffer between a dependency ending and its dependent starting */}
-          {planningMode === 'epic' && (
-            <>
-              <span style={{ fontSize: 11, color: '#97A0AF' }}>|</span>
-              <label style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600 }}>Buffer:</label>
-              <input type="number" value={bufferDays} min={0}
-                onChange={e => setBufferDays(Math.max(0, Number(e.target.value)))}
-                title="Extra working days after a dependency ends before its dependent can start"
-                style={{ width: 34, padding: '3px 6px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
-              <span style={{ fontSize: 11, color: '#5E6C84' }}>d</span>
-            </>
-          )}
-
-          {/* Plan start date */}
-          <label style={{ fontSize: 11, color: '#5E6C84', fontWeight: 600 }}>From:</label>
-          <input type="date" value={planStart} onChange={e => setPlanStart(snapToWorkingDay(e.target.value))}
-            style={{ padding: '4px 8px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4 }} />
 
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <button onClick={() => setMaximized(m => !m)}
@@ -2104,32 +2837,22 @@ export default function VersionPlanningView({ projectKeys }) {
             <button onClick={autoScheduleAll} disabled={autoScheduling} style={btnStyle('#E9F2FF', '#0052CC', '#B3D4FF')}>
               {autoScheduling ? 'Scheduling…' : 'Auto-schedule'}
             </button>
-            <button onClick={clearAllScheduling} title="Unschedule everything in view — keeps developers and milestones"
-              style={btnStyle('#FFF0B3', '#974F0C', '#FFD700')}>
-              Clear all
-            </button>
-            {planningMode === 'epic' && (
-              <button onClick={() => setShowDebugPanel(v => !v)} title="Show a raw data table of every story/subtask's computed schedule"
-                style={btnStyle(showDebugPanel ? '#172B4D' : '#F4F5F7', showDebugPanel ? '#fff' : '#42526E', '#DFE1E6')}>
-                🐛 Debug
-              </button>
-            )}
-            {planningMode === 'epic' && (
-              <button onClick={exportTimelineHtml} title="Download a self-contained HTML report: summary, timeline, milestones, critical path, team utilization, and the full debug table"
-                style={btnStyle('#E9F2FF', '#0052CC', '#B3D4FF')}>
-                ⬇ Export HTML
-              </button>
-            )}
-            <button onClick={() => { setDepsMode(m => !m); setDepsSource(null); }}
-              style={btnStyle(depsMode ? '#FFF0B3' : '#F4F5F7', depsMode ? '#974F0C' : '#42526E', depsMode ? '#FFD700' : '#DFE1E6')}>
-              {depsMode ? (depsSource ? `→ Click target` : '→ Click source') : '+ Dependency'}
-            </button>
-            <button onClick={() => setEditingMilestone({ id: null, label: '', date: workingDays[10] || TODAY_STR, color: MILESTONE_COLORS[0] })}
+            <button onClick={refreshFromJira} disabled={refreshing || issuesLoading}
+              title="Re-fetch epics/stories from Jira — picks up epics added to or removed from this version since the page loaded"
               style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>
-              + Milestone
+              {refreshing || issuesLoading ? '↻ Refreshing…' : '↻ Refresh from Jira'}
             </button>
-            <label style={{ fontSize: 11, color: '#5E6C84', display: 'flex', alignItems: 'center', gap: 4 }}>
-              <input type="checkbox" checked={updateDueDates} onChange={e => setUpdateDueDates(e.target.checked)} />
+            {refreshNote && (
+              <span style={{
+                fontSize: 11, padding: '3px 8px', borderRadius: 3,
+                background: refreshNote.startsWith('✓') ? '#E3FCEF' : '#FFF0B3',
+                color: refreshNote.startsWith('✓') ? '#00875A' : '#974F0C',
+              }}>{refreshNote}</span>
+            )}
+            <label style={{ fontSize: 11, color: isFinalContext ? '#97A0AF' : '#5E6C84', display: 'flex', alignItems: 'center', gap: 4 }}
+              title={isFinalContext ? 'Final plans always write due dates back to Jira' : undefined}>
+              <input type="checkbox" checked={isFinalContext ? true : updateDueDates} disabled={isFinalContext}
+                onChange={e => setUpdateDueDates(e.target.checked)} />
               Update Jira due dates
             </label>
             {autoSaveStatus && (
@@ -2144,171 +2867,42 @@ export default function VersionPlanningView({ projectKeys }) {
             )}>
               {saving ? 'Saving…' : saveStatus === 'saved' ? '✓ Saved' : saveStatus === 'error' ? '✗ Error' : 'Save to Jira'}
             </button>
-            <button onClick={() => setPlanDialog({ type: 'clear' })}
-              style={btnStyle('#FFEBE6', '#DE350B', '#FF8F73')}>
-              Clear
-            </button>
           </div>
         </div>
 
-        {/* Developer placeholders row — hidden while maximized to save vertical space */}
-        {!maximized && (
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 11, color: '#5E6C84', fontWeight: 700, flexShrink: 0 }}>Developers:</span>
-            {(plan.placeholders || []).map(ph => (
-              <span key={ph.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                {editingPhId === ph.id ? (
-                  <input autoFocus value={editingPhValue}
-                    onChange={e => setEditingPhValue(e.target.value)}
-                    onBlur={() => { renamePlaceholder(ph.id, editingPhValue); setEditingPhId(null); }}
-                    onKeyDown={e => { if (e.key === 'Enter') { renamePlaceholder(ph.id, editingPhValue); setEditingPhId(null); } }}
-                    style={{ width: 80, fontSize: 11, border: `1.5px solid ${ph.color}`, borderRadius: 4, padding: '2px 6px' }}
-                  />
-                ) : (
-                  <>
-                    <Chip label={ph.name} color={ph.color} selected={focusDevId === ph.id}
-                      onClick={() => setFocusDevId(prev => prev === ph.id ? null : ph.id)}
-                      onRemove={() => removePlaceholder(ph.id)} />
-                    <span onClick={() => { setEditingPhId(ph.id); setEditingPhValue(ph.name); }}
-                      title="Rename" style={{ cursor: 'pointer', fontSize: 10, color: '#97A0AF', padding: '0 2px' }}>✎</span>
-                  </>
-                )}
-              </span>
-            ))}
-            {focusDevId && (
-              <button onClick={() => setFocusDevId(null)}
-                style={{ ...btnStyle('#FFEBE6', '#DE350B', '#FF8F73'), padding: '3px 8px', fontSize: 11 }}>
-                ✕ Show all
-              </button>
+        {/* Panel-toggle row — everything that used to be a permanent banner or a
+            secondary settings row now lives behind one of these, in the right panel */}
+        {selectedPlanId && (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+            <PanelToggleBtn icon="📊" label="Summary"
+              badge={(conflicts.length + Object.keys(missingEstMap).length) || null}
+              active={activePanel === 'summary'}
+              onClick={() => setActivePanel(p => p === 'summary' ? null : 'summary')} />
+            <PanelToggleBtn icon="⚙" label="Settings"
+              active={activePanel === 'settings'}
+              onClick={() => setActivePanel(p => p === 'settings' ? null : 'settings')} />
+            <PanelToggleBtn icon="👥" label="Team"
+              badge={(plan.placeholders || []).length || null} badgeColor="#0052CC"
+              active={activePanel === 'team'}
+              onClick={() => setActivePanel(p => p === 'team' ? null : 'team')} />
+            <PanelToggleBtn icon="🔗" label="Tools"
+              active={activePanel === 'tools'}
+              onClick={() => setActivePanel(p => p === 'tools' ? null : 'tools')} />
+            {planningMode === 'epic' && (
+              <PanelToggleBtn icon="🐛" label="Debug"
+                active={activePanel === 'debug'}
+                onClick={() => setActivePanel(p => p === 'debug' ? null : 'debug')} />
             )}
-            <button onClick={recolorPlaceholders} title="Reassign every developer's color from the current palette — fixes similar/duplicate colors"
-              style={{ ...btnStyle('#F4F5F7', '#42526E', '#DFE1E6'), padding: '3px 8px', fontSize: 11 }}>
-              🎨 Fix colors
-            </button>
-            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-              <input value={newPhName} onChange={e => setNewPhName(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && newPhName.trim()) { addPlaceholder(newPhName); setNewPhName(''); } }}
-                placeholder="+ Add developer"
-                style={{ fontSize: 11, border: '1.5px dashed #B3D4FF', borderRadius: 4, padding: '3px 8px', width: 120, outline: 'none' }}
-              />
-              {newPhName.trim() && (
-                <button onClick={() => { addPlaceholder(newPhName); setNewPhName(''); }}
-                  style={{ ...btnStyle('#E9F2FF', '#0052CC', '#B3D4FF'), padding: '3px 8px', fontSize: 11 }}>Add</button>
-              )}
-            </div>
+            {depNote && (
+              <span style={{
+                marginLeft: 'auto', fontSize: 11, fontWeight: 600, padding: '4px 8px', borderRadius: 4,
+                background: depNote.startsWith("Can't") ? '#FFEBE6' : '#E3FCEF',
+                color: depNote.startsWith("Can't") ? '#DE350B' : '#00875A',
+              }}>{depNote}</span>
+            )}
           </div>
         )}
       </div>
-
-      {/* ── Overlap alert toast — hidden while maximized ── */}
-      {!maximized && overlapAlert && (
-        <div style={{ background: '#FFEBE6', borderBottom: '1px solid #FF5630', padding: '7px 14px', fontSize: 12, color: '#DE350B', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          🔴 <strong>Developer overlap detected:</strong>
-          {overlapAlert.conflicts.map(function(c, i) {
-            return <span key={i} style={{ fontWeight: 600 }}>{c.placeholder.name}: {c.source} ↔ {c.target}</span>;
-          })}
-          <button onClick={() => setOverlapAlert(null)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#DE350B', fontSize: 16, lineHeight: 1 }}>×</button>
-        </div>
-      )}
-
-      {/* ── Debug panel (Epic Timeline mode) — raw schedule data, copy/paste-able ── */}
-      {showDebugPanel && planningMode === 'epic' && (
-        <div style={{ background: '#172B4D', color: '#fff', flexShrink: 0, maxHeight: 260, overflow: 'auto', fontSize: 11 }}>
-          <div style={{ position: 'sticky', top: 0, display: 'flex', alignItems: 'center', gap: 10, padding: '6px 12px', background: '#0E1B31', borderBottom: '1px solid #344563' }}>
-            <strong>Debug: {focusEpicKey || '(no epic selected)'} — {debugRows.length} rows</strong>
-            <button
-              onClick={() => {
-                const cols = ['key', 'type', 'parentKey', 'status', 'jiraAssignee', 'assignedDevs', 'borrowedFromParent', 'startDate', 'endDate', 'isActual', 'historyResolved', 'roughHours', 'dependencies'];
-                const header = cols.join('\t');
-                const lines = debugRows.map(r => cols.map(c => String(r[c] ?? '')).join('\t'));
-                const text = [header, ...lines].join('\n');
-                navigator.clipboard.writeText(text).then(() => {
-                  setDebugCopied(true);
-                  setTimeout(() => setDebugCopied(false), 2000);
-                }).catch(() => {});
-              }}
-              style={{ marginLeft: 'auto', padding: '3px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', borderRadius: 4, border: '1px solid #5E6C84', background: debugCopied ? '#00875A' : '#344563', color: '#fff' }}>
-              {debugCopied ? '✓ Copied' : '⎘ Copy table'}
-            </button>
-            <button onClick={() => setShowDebugPanel(false)} style={{ padding: '3px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 4, border: '1px solid #5E6C84', background: '#344563', color: '#fff' }}>✕</button>
-          </div>
-          <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-            <thead>
-              <tr style={{ background: '#0E1B31' }}>
-                {['Key', 'Type', 'Parent', 'Status', 'Jira Assignee', 'Assigned Dev(s)', 'Borrowed?', 'Start', 'End', 'Actual?', 'Resolved?', 'Rough Hrs', 'Dependencies'].map(h => (
-                  <th key={h} style={{ padding: '4px 8px', textAlign: 'left', borderBottom: '1px solid #344563', whiteSpace: 'nowrap', position: 'sticky', top: 26 }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {debugRows.map(r => (
-                <tr key={r.key} style={{ borderBottom: '1px solid #253858' }}>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap', fontWeight: r.type !== 'Subtask' ? 700 : 400 }}>{r.key}</td>
-                  <td style={{ padding: '3px 8px' }}>{r.type}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap' }}>{r.parentKey}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap' }}>{r.status}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap' }}>{r.jiraAssignee}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap' }}>{r.assignedDevs}</td>
-                  <td style={{ padding: '3px 8px' }}>{r.borrowedFromParent ? 'yes' : ''}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap', color: '#79E2F2' }}>{r.startDate}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap', color: '#79E2F2' }}>{r.endDate}</td>
-                  <td style={{ padding: '3px 8px' }}>{r.isActual ? '🔒' : ''}</td>
-                  <td style={{ padding: '3px 8px' }}>{r.historyResolved ? '✓' : ''}</td>
-                  <td style={{ padding: '3px 8px' }}>{r.roughHours}</td>
-                  <td style={{ padding: '3px 8px', whiteSpace: 'nowrap' }}>{r.dependencies}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* ── Missing estimate warnings — hidden while maximized ── */}
-      {!maximized && Object.keys(missingEstMap).length > 0 && (
-        <div style={{ background: '#FFFAE6', borderBottom: '1px solid #FFE380', padding: '5px 16px', fontSize: 11, color: '#974F0C', flexShrink: 0 }}>
-          ⚠ {Object.keys(missingEstMap).length} issue(s) have missing or incomplete estimates
-          {estSource === 'children' ? ' (some tasks/subtasks have no Original Estimate)' : ' (Rough Estimation field not set)'}.
-          Duration calculations for those rows may be inaccurate.
-        </div>
-      )}
-
-      {/* ── Conflict warnings — hidden while maximized ── */}
-      {!maximized && conflicts.length > 0 && (
-        <div style={{ background: '#FFFAE6', borderBottom: '1px solid #FFE380', padding: '6px 16px', fontSize: 11, flexShrink: 0 }}>
-          {conflicts.map((c, i) => (
-            <span key={i} style={{ marginRight: 12, color: '#974F0C' }}>
-              ⚠ {c.placeholder.name}: {c.source} ↔ {c.target} overlap —
-              <button onClick={() => {
-                updateIssueEntry(c.target, {
-                  dependencies: [...new Set([...(computedPlan.issues?.[c.target]?.dependencies || []), c.source])],
-                });
-              }} style={{ marginLeft: 4, fontSize: 10, border: '1px solid #FFD700', background: '#FFF0B3', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', color: '#974F0C' }}>
-                Auto-chain
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* ── Draft mode info banner ── */}
-      {planningMode === 'draft' && selectedPlanId && (
-        <div style={{ background: '#EAE6FF', borderBottom: '1px solid #C0B6F2', padding: '5px 16px', fontSize: 11, color: '#403294', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ fontWeight: 700 }}>Draft mode:</span>
-          Epics only · Duration = rough est ÷ devs · Assigning the same developer to multiple epics auto-creates dependencies
-        </div>
-      )}
-
-      {/* ── Summary panel ── */}
-      {selectedPlanId && (
-        <SummaryPanel
-          computedPlan={computedPlan}
-          roughMapArg={roughMap}
-          rows={rows}
-          conflicts={conflicts}
-          planIndex={planIndex}
-          selectedPlanId={selectedPlanId}
-        />
-      )}
 
       {selectedVersionId && !selectedPlanId && !indexLoading && planIndex.length === 0 && (
         <div style={{ padding: 32, textAlign: 'center', fontSize: 13, color: '#5E6C84' }}>
@@ -2325,6 +2919,8 @@ export default function VersionPlanningView({ projectKeys }) {
         </div>
       )}
 
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {(!selectedVersionId || !selectedPlanId) ? null : issuesLoading || planLoading ? (
         <div style={{ padding: 32, textAlign: 'center', color: '#97A0AF', fontSize: 13 }}>Loading…</div>
       ) : issuesError ? (
@@ -2349,10 +2945,23 @@ export default function VersionPlanningView({ projectKeys }) {
                 Summary{sortIndicator('summary')}
                 <ColResizer colKey="summary" setColWidths={setColWidths} min={80} />
               </div>
-              <div onClick={() => handleSort('est')} style={{ ...cellStyle, width: colWidths.est, fontWeight: 700, textAlign: 'right', position: 'relative', cursor: 'pointer', userSelect: 'none' }}>
-                Est{sortIndicator('est')}
+              <div onClick={() => handleSort('est')} style={{ ...cellStyle, width: colWidths.est, fontWeight: 700, textAlign: 'right', position: 'relative', cursor: 'pointer', userSelect: 'none' }}
+                title={planningMode === 'draft' ? 'Total estimate — full original size, ignoring status' : undefined}>
+                {planningMode === 'draft' ? 'Total Est' : 'Est'}{sortIndicator('est')}
                 <ColResizer colKey="est" setColWidths={setColWidths} min={36} />
               </div>
+              <div onClick={() => handleSort('rough')} style={{ ...cellStyle, width: colWidths.rough, fontWeight: 700, textAlign: 'right', position: 'relative', cursor: 'pointer', userSelect: 'none', color: '#6554C0' }}
+                title="The Rough Estimation field's own value in Jira — shown regardless of the Estimate-source setting, with no rollup or inherited share applied">
+                Rough{sortIndicator('rough')}
+                <ColResizer colKey="rough" setColWidths={setColWidths} min={36} />
+              </div>
+              {planningMode === 'draft' && (
+                <div onClick={() => handleSort('remaining')} style={{ ...cellStyle, width: colWidths.remaining, fontWeight: 700, textAlign: 'right', position: 'relative', cursor: 'pointer', userSelect: 'none' }}
+                  title="Total minus already dev-done children (In Review / Ready for Testing / Ready for Deployment / Done) — this is what's actually scheduled on the timeline">
+                  Remaining{sortIndicator('remaining')}
+                  <ColResizer colKey="remaining" setColWidths={setColWidths} min={40} />
+                </div>
+              )}
               <div onClick={() => handleSort('assigned')} style={{ ...cellStyle, width: colWidths.assigned, fontWeight: 700, position: 'relative', cursor: 'pointer', userSelect: 'none' }}>
                 Assigned{sortIndicator('assigned')}
                 <ColResizer colKey="assigned" setColWidths={setColWidths} min={50} />
@@ -2370,13 +2979,21 @@ export default function VersionPlanningView({ projectKeys }) {
             {sortedRows.map(row => {
               const f = row.fields || {};
               const roughH = roughMap[row.key];
+              const remainingH = remainingEstMap[row.key];
               const entry = computedPlan.issues?.[row.key] || {};
-              const devs = (entry.assignedPlaceholders || []).length || 0;
-              const days = roughH && devs ? calcDays(roughH, devs) : null;
+              const devs = entry.assignedPlaceholders?.length ? effectiveDevCount(entry.assignedPlaceholders, computedPlan.placeholders) : 0;
+              const days = schedMap[row.key] && devs ? calcDays(schedMap[row.key], devs) : null;
               const isEpic = row._isEpic;
               const isDepsTarget = depsMode && depsSource && depsSource !== row.key;
               const isDepsSrc = depsMode && !depsSource;
               const isLocked = !!entry.actualEndDate; // real dates from Jira status history — still movable, but moving it overrides the real date
+              const estCoverage = estCoverageMap[row.key];
+              // Very light status tint on the row itself (this table only, never the Gantt):
+              // red for Validation (needs attention), green once dev work is finished.
+              const _rowStatus = normalizeStatusName(f.status?.name);
+              const rowStatusTint = _rowStatus === 'validation' ? '#FFF5F4'
+                : DEV_DONE_STATUSES.includes(_rowStatus) ? '#F3FCF7'
+                : null;
               return (
                 <div key={row.key}
                   draggable
@@ -2387,23 +3004,39 @@ export default function VersionPlanningView({ projectKeys }) {
                   style={{
                     display: 'flex', alignItems: 'center', height: ROW_HEIGHT,
                     borderBottom: '1px solid #F4F5F7',
-                    background: depsSource === row.key ? '#FFF0B3' : isDepsTarget ? '#E9F2FF' : entry.startDate ? '#E3FCEF' : isEpic ? '#EAE6FF22' : '#fff',
+                    background: depsSource === row.key ? '#FFF0B3' : isDepsTarget ? '#E9F2FF'
+                      : rowStatusTint ? rowStatusTint
+                      : entry.startDate ? '#E3FCEF' : isEpic ? '#EAE6FF22' : '#fff',
                     cursor: depsMode ? 'crosshair' : 'grab',
                   }}>
                   {/* Key */}
                   <div style={{ ...cellStyle, width: colWidths.key, paddingLeft: isEpic ? 8 : row._isSubtask ? 32 : 20 }}>
                     {isLocked && <span title="Dates are from Jira status history — drag to override with a manual date" style={{ fontSize: 9, marginRight: 3, flexShrink: 0 }}>🔒</span>}
-                    {isEpic && planningMode === 'final' && (
-                      <span onClick={e => { e.stopPropagation(); setExpandedEpics(prev => { const n = new Set(prev); n.has(row.key) ? n.delete(row.key) : n.add(row.key); return n; }); }}
-                        style={{ cursor: 'pointer', fontSize: 9, marginRight: 4, color: '#6554C0' }}>
-                        {expandedEpics.has(row.key) ? '▼' : '▶'}
-                      </span>
+                    {/* Carets render only when there's actually something to expand — an
+                        arrow that opens to nothing reads as a bug (and was one: see the
+                        version-inheritance fix in useEpicHierarchy). */}
+                    {isEpic && (planningMode === 'final' || planningMode === 'draft') && (
+                      (storiesByEpic[row.key] || []).length > 0 ? (
+                        <span onClick={e => { e.stopPropagation(); setExpandedEpics(prev => { const n = new Set(prev); n.has(row.key) ? n.delete(row.key) : n.add(row.key); return n; }); }}
+                          title={`${(storiesByEpic[row.key] || []).length} stor${(storiesByEpic[row.key] || []).length === 1 ? 'y' : 'ies'} in this version`}
+                          style={{ cursor: 'pointer', fontSize: 9, marginRight: 4, color: '#6554C0' }}>
+                          {expandedEpics.has(row.key) ? '▼' : '▶'}
+                        </span>
+                      ) : (
+                        <span title="No stories in this version — the epic carries the version but has no child stories tagged to it (or none at all)"
+                          style={{ fontSize: 9, marginRight: 4, color: '#DFE1E6' }}>·</span>
+                      )
                     )}
                     {row._isStory && planningMode === 'epic' && (
-                      <span onClick={e => { e.stopPropagation(); setExpandedStories(prev => { const n = new Set(prev); n.has(row.key) ? n.delete(row.key) : n.add(row.key); return n; }); }}
-                        style={{ cursor: 'pointer', fontSize: 9, marginRight: 4, color: '#0052CC' }}>
-                        {expandedStories.has(row.key) ? '▼' : '▶'}
-                      </span>
+                      (subtasksByStory[row.key] || []).length > 0 ? (
+                        <span onClick={e => { e.stopPropagation(); setExpandedStories(prev => { const n = new Set(prev); n.has(row.key) ? n.delete(row.key) : n.add(row.key); return n; }); }}
+                          title={`${(subtasksByStory[row.key] || []).length} subtask(s)`}
+                          style={{ cursor: 'pointer', fontSize: 9, marginRight: 4, color: '#0052CC' }}>
+                          {expandedStories.has(row.key) ? '▼' : '▶'}
+                        </span>
+                      ) : (
+                        <span title="No subtasks" style={{ fontSize: 9, marginRight: 4, color: '#DFE1E6' }}>·</span>
+                      )
                     )}
                     <span
                       onClick={e => { e.stopPropagation(); setDetailIssueKey(row.key); }}
@@ -2426,9 +3059,22 @@ export default function VersionPlanningView({ projectKeys }) {
                       })()}
                     </span>
                   </div>
-                  {/* Summary */}
-                  <div style={{ ...cellStyle, width: colWidths.summary, fontSize: 11, color: '#172B4D', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f.summary}>
-                    {f.summary}
+                  {/* Summary — epics also carry an estimate-coverage badge when some of
+                      their stories are unestimated, so a rolled-up total that only covers
+                      part of the real scope can't be mistaken for a complete one. */}
+                  <div style={{ ...cellStyle, width: colWidths.summary, fontSize: 11, color: '#172B4D', overflow: 'hidden', whiteSpace: 'nowrap', gap: 4 }} title={f.summary}>
+                    {isEpic && estCoverage && estCoverage.pct < 100 && (
+                      <span
+                        title={estCoverage.estimated === 0
+                          ? `None of this epic's ${estCoverage.total} stories carry their own estimate — the ${roughH != null ? roughH + 'h' : 'epic'} total is spread evenly across them for scheduling. Estimate the stories individually for an accurate plan.`
+                          : `Only ${estCoverage.estimated} of ${estCoverage.total} stories carry their own estimate (${estCoverage.pct}%) — the rest share out the epic's remaining hours, so this plan is only as accurate as that split.`}
+                        style={{
+                          fontSize: 9, fontWeight: 700, padding: '1px 4px', borderRadius: 3, flexShrink: 0,
+                          background: estCoverage.pct < 50 ? '#FFEBE6' : '#FFFAE6',
+                          color: estCoverage.pct < 50 ? '#DE350B' : '#974F0C',
+                        }}>{estCoverage.pct}%</span>
+                    )}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.summary}</span>
                   </div>
                   {/* Est — click to edit inline; only persisted to Jira on "Save to Jira" */}
                   <div
@@ -2462,23 +3108,72 @@ export default function VersionPlanningView({ projectKeys }) {
                       </span>
                     )}
                   </div>
-                  {/* Assigned placeholders */}
+                  {/* Rough — the Rough Estimation field's raw value, always, so it can be
+                      compared against whatever the Estimate-source toggle is currently using. */}
+                  <div style={{ ...cellStyle, width: colWidths.rough, textAlign: 'right', fontSize: 11 }}
+                    title={rawRoughMap[row.key] != null
+                      ? `Rough Estimation field: ${rawRoughMap[row.key]}h`
+                      : 'No Rough Estimation value set on this issue'}>
+                    {rawRoughMap[row.key] != null ? (
+                      <span style={{ color: '#6554C0', fontWeight: 600 }}>
+                        {rawRoughMap[row.key] % 1 === 0 ? rawRoughMap[row.key] : rawRoughMap[row.key].toFixed(1)}h
+                      </span>
+                    ) : (
+                      <span style={{ color: '#97A0AF' }}>—</span>
+                    )}
+                  </div>
+                  {/* Remaining Est — Draft mode only: total minus already dev-done children.
+                      This, not the total, is what actually drives the epic's bar duration when
+                      you drag/schedule it (schedMap). Not directly editable — it's derived. */}
+                  {planningMode === 'draft' && (
+                    <div style={{ ...cellStyle, width: colWidths.remaining, textAlign: 'right', fontSize: 11 }}
+                      title={remainingH !== roughH ? `${roughH ?? 0}h total, ${remainingH ?? 0}h remaining (some children are already dev-done)` : 'No children are dev-done yet — remaining equals total'}>
+                      {remainingH != null ? (
+                        <span style={{ color: remainingH < (roughH || 0) ? '#00875A' : '#42526E', fontWeight: 600 }}>
+                          {remainingH % 1 === 0 ? remainingH : remainingH.toFixed(1)}h
+                        </span>
+                      ) : (
+                        <span style={{ color: '#97A0AF' }}>—</span>
+                      )}
+                    </div>
+                  )}
+                  {/* Assigned placeholders — only the devs actually assigned to THIS row are
+                      shown as solid dots (click to unassign); a large team roster (e.g. 11
+                      devs) used to render every single placeholder here regardless of
+                      assignment, wrapping to several lines that overflowed the row's fixed
+                      height and visually bled into neighboring rows. Adding a dev now goes
+                      through the compact "+" selector instead of needing all of them on screen
+                      at once. */}
                   <div style={{ ...cellStyle, width: colWidths.assigned, display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-                    {(plan.placeholders || []).map(ph => {
-                      const assigned = (entry.assignedPlaceholders || []).includes(ph.id);
-                      const borrowed = assigned && entry.borrowedFromParent;
+                    {(entry.assignedPlaceholders || []).map(phId => {
+                      const ph = phMap[phId];
+                      if (!ph) return null;
+                      const borrowed = entry.borrowedFromParent;
+                      const capLabel = typeof ph.capacityPct === 'number' && ph.capacityPct < 100 ? ` (${ph.capacityPct}% capacity)` : '';
                       return (
                         <span key={ph.id} onClick={e => { e.stopPropagation(); togglePlaceholder(row.key, ph.id); }}
-                          title={borrowed ? `${ph.name} (inherited from parent story)` : ph.name}
+                          title={(borrowed ? `${ph.name} (inherited from parent story) — click to remove` : `${ph.name} — click to remove`) + capLabel}
                           style={{
-                            width: 16, height: 16, borderRadius: '50%', cursor: 'pointer',
-                            background: assigned ? ph.color : '#F4F5F7',
-                            border: `1.5px solid ${assigned ? ph.color : '#DFE1E6'}`,
+                            width: 17, height: 17, borderRadius: '50%', cursor: 'pointer',
+                            background: ph.color, border: `1.5px solid ${ph.color}`,
                             opacity: borrowed ? 0.4 : 1,
                             flexShrink: 0,
-                          }} />
+                            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                            fontSize: 7, fontWeight: 800, color: '#fff', letterSpacing: '-0.03em',
+                          }}>{devInitials(ph.name)}</span>
                       );
                     })}
+                    {(plan.placeholders || []).length > 0 && (
+                      <select value="" onClick={e => e.stopPropagation()}
+                        onChange={e => { if (e.target.value) togglePlaceholder(row.key, e.target.value); }}
+                        title="Assign a developer"
+                        style={{ fontSize: 9, border: '1.5px dashed #B3D4FF', borderRadius: 8, cursor: 'pointer', padding: '0 2px', height: 16, color: '#0052CC', background: '#fff', flexShrink: 0 }}>
+                        <option value="">+</option>
+                        {(plan.placeholders || [])
+                          .filter(ph => !(entry.assignedPlaceholders || []).includes(ph.id))
+                          .map(ph => <option key={ph.id} value={ph.id}>{ph.name}</option>)}
+                      </select>
+                    )}
                     {!(plan.placeholders || []).length && <span style={{ fontSize: 10, color: '#97A0AF' }}>add devs ↑</span>}
                   </div>
                   {/* QA days — Draft mode only */}
@@ -2529,11 +3224,44 @@ export default function VersionPlanningView({ projectKeys }) {
 
               {/* Date headers */}
               <div style={{ position: 'sticky', top: 0, zIndex: 10, height: HEADER_H, display: 'flex', background: '#F4F5F7', borderBottom: '1px solid #DFE1E6' }}>
+                {/* Sprint bands — a labeled colored strip across the header's bottom edge, so
+                    sprints are obviously marked at a glance rather than relying only on the
+                    thin dotted boundary lines further down in the Gantt body. Alternates two
+                    colors by index so adjacent sprints are visually distinguishable; clipped
+                    to the visible workingDays window (a sprint that starts/ends outside it
+                    still shows the portion that overlaps). */}
+                {sprints.map((sprint, i) => {
+                  const startDateStr = sprint.startDate ? snapToWorkingDay(sprint.startDate.slice(0, 10)) : null;
+                  const endDateStr = sprint.endDate ? snapToWorkingDay(sprint.endDate.slice(0, 10)) : null;
+                  let startIdx = startDateStr ? workingDays.indexOf(startDateStr) : -1;
+                  let endIdx = endDateStr ? workingDays.indexOf(endDateStr) : -1;
+                  if (startIdx < 0 && endIdx < 0) return null;
+                  if (startIdx < 0) startIdx = 0;
+                  if (endIdx < 0) endIdx = workingDays.length - 1;
+                  if (endIdx < startIdx) return null;
+                  const left = startIdx * DAY_WIDTH;
+                  const width = (endIdx - startIdx + 1) * DAY_WIDTH;
+                  const color = i % 2 === 0 ? '#6554C0' : '#0052CC';
+                  return (
+                    <div key={sprint.id}
+                      title={`${sprint.name}${sprint.state ? ` (${sprint.state})` : ''}: ${sprint.startDate?.slice(0, 10) || '?'} → ${sprint.endDate?.slice(0, 10) || '?'}`}
+                      style={{
+                        // Explicit z-index required: the day cells below are `position:
+                        // relative` and rendered LATER in DOM order — per CSS stacking rules,
+                        // same-layer (z-index:auto) positioned siblings paint in DOM order
+                        // regardless of which is visually "behind", so without this the day
+                        // cells painted over these bands and the colors never showed.
+                        position: 'absolute', left, width: Math.max(width - 1, 2), bottom: 0, height: 14, zIndex: 1,
+                        background: color, opacity: 0.85, borderRadius: '3px 3px 0 0',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden',
+                        fontSize: 8, fontWeight: 700, color: '#fff', whiteSpace: 'nowrap', pointerEvents: 'none',
+                      }}>{sprint.name}</div>
+                  );
+                })}
                 {workingDays.map((day, idx) => {
                   const d = parseISO(day);
                   const isToday = day === TODAY_STR;
                   const isMonday = getDay(d) === 1;
-                  const hasMilestone = (computedPlan.milestones || []).some(m => m.date === day);
                   return (
                     <div key={day} onClick={() => setEditingMilestone({ id: null, label: '', date: day, color: MILESTONE_COLORS[0] })}
                       title="Click to add milestone"
@@ -2546,10 +3274,43 @@ export default function VersionPlanningView({ projectKeys }) {
                         cursor: 'pointer', position: 'relative',
                       }}>
                       {isMonday || idx === 0 ? format(d, 'MMM d') : format(d, 'd')}
-                      {hasMilestone && <span style={{ width: 6, height: 6, background: '#FF991F', borderRadius: '50%', position: 'absolute', bottom: 3 }} />}
                     </div>
                   );
                 })}
+
+                {/* Milestone labels — live in the header's TOP strip (sprint bands own the
+                    bottom strip) as plain positioned divs, not the SVG overlay below. They used
+                    to be an SVG pill drawn at the same y-range as this sticky header — since the
+                    header has its own z-index and (as of the sprint bands above) an opaque
+                    background at the bottom, the SVG pill was rendering BEHIND it: invisible,
+                    and unclickable, which is exactly what "I see the dot but no label and can't
+                    edit it" was — the old fallback dot (in the day cell below) was the only
+                    thing still visible. Multiple milestones sharing a date are staggered
+                    horizontally so they don't sit exactly on top of each other. */}
+                {(() => {
+                  const byDate = {};
+                  (computedPlan.milestones || []).forEach(m => { (byDate[m.date] = byDate[m.date] || []).push(m); });
+                  return (computedPlan.milestones || []).map(m => {
+                    const idx = workingDays.indexOf(m.date);
+                    if (idx < 0) return null;
+                    const siblings = byDate[m.date];
+                    const pos = siblings.indexOf(m);
+                    const pillWidth = Math.max(m.label.length * 5.5, 16);
+                    const x = idx * DAY_WIDTH + DAY_WIDTH / 2 + pos * (pillWidth * 0.65);
+                    return (
+                      <div key={m.id} onClick={e => { e.stopPropagation(); setEditingMilestone({ ...m }); }}
+                        title={`${m.label} — ${m.date}${siblings.length > 1 ? ` (${siblings.length} milestones this day — click to edit this one)` : ''} — click to edit`}
+                        style={{
+                          position: 'absolute', left: x, top: 1, transform: 'translateX(-50%)',
+                          zIndex: 20 + pos, maxWidth: 100,
+                          background: m.color, color: '#fff', fontSize: 8, fontWeight: 700,
+                          padding: '2px 5px', borderRadius: 3, cursor: 'pointer',
+                          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                        }}>{m.label}</div>
+                    );
+                  });
+                })()}
               </div>
 
               {/* Row bars */}
@@ -2574,11 +3335,25 @@ export default function VersionPlanningView({ projectKeys }) {
                         - Final mode epics: summary bar spanning all placed stories
                         - Stories / tasks: standard draggable bar */}
                     {row._isEpic && planningMode === 'draft' ? (bar && (() => {
-                      const _devs = phs.length || 1;
-                      const { qaDays: _qaDays, bugFixDays: _bfDays } = calcQaBugFixDays(roughMap[row.key], _devs, qaMap[row.key] || 0, bugFixPct);
+                      const _devs = phs.reduce((s, p) => s + (typeof p.capacityPct === 'number' ? p.capacityPct : 100) / 100, 0) || 1;
+                      const { qaDays: _qaDays, bugFixDays: _bfDays } = calcQaBugFixDays(qaBaseMap[row.key], _devs, qaMap[row.key] || 0, bugFixPct);
+                      const _statusBorder = statusBorderColor(row.fields?.status?.name);
+                      // An epic can be locked two different ways: `bar.jiraLocked` (derived by
+                      // getBarProps — a CHILD story carries the real Jira date, the epic's own
+                      // entry has none) or `entry.jiraLocked` (the epic itself was dropped and
+                      // has its OWN Jira Due date, set directly by placeOnTimeline). Only the
+                      // first was ever checked here, so a directly-locked epic like this one
+                      // silently rendered as a normal draggable bar with no 🔒 at all.
+                      const _lockedByChildren = !!bar.jiraLocked;
+                      const _lockedDirectly = !_lockedByChildren && !!entry.jiraLocked;
+                      const _isLocked = _lockedByChildren || _lockedDirectly;
                       return (<>
                       <div
-                        draggable
+                        // Not draggable while locked: either the bar's span is computed from
+                        // locked child stories (ignoring the epic's own entry, so a drag would
+                        // set startDate but produce no visible change) or the epic's own entry
+                        // is itself pinned to a real Jira date. Unlock via 🔒 first either way.
+                        draggable={!_isLocked}
                         onDragStart={e => {
                           e.stopPropagation();
                           window.__versionPlanDrag = { issueKey: row.key };
@@ -2589,11 +3364,16 @@ export default function VersionPlanningView({ projectKeys }) {
                           position: 'absolute',
                           left: bar.left, top: 5,
                           width: bar.width, height: ROW_HEIGHT - 10,
-                          background: phs.length === 1 ? phs[0].color : phs.length > 1 ? `linear-gradient(90deg, ${phs.map(p => p.color).join(', ')})` : '#6554C0',
-                          borderRadius: 4, cursor: 'grab', opacity: 0.88,
+                          // Locked because a child story carries a real Jira date → grey, not
+                          // the developer's color: the span is the children's fact, not a plan
+                          // choice, until every locked child is unlocked (see the 🔒 below).
+                          background: _isLocked
+                            ? '#8993A4'
+                            : phs.length === 1 ? phs[0].color : phs.length > 1 ? `linear-gradient(90deg, ${phs.map(p => p.color).join(', ')})` : '#6554C0',
+                          borderRadius: 4, cursor: _isLocked ? 'not-allowed' : 'grab', opacity: 0.88,
                           display: 'flex', alignItems: 'center', paddingLeft: 6, paddingRight: 18, gap: 4,
                           overflow: 'hidden', userSelect: 'none',
-                          border: conflictingKeys.has(row.key) ? '2px solid #FF5630' : '2px solid rgba(255,255,255,0.25)',
+                          border: conflictingKeys.has(row.key) ? '2px solid #FF5630' : _isLocked ? '2px solid #5E6C84' : _statusBorder ? `3px solid ${_statusBorder}` : '2px solid rgba(255,255,255,0.25)',
                           outline: criticalPathKeys.has(row.key) && !conflictingKeys.has(row.key) ? '2px solid #FF991F' : 'none',
                           outlineOffset: 1,
                           boxShadow: conflictingKeys.has(row.key)
@@ -2601,29 +3381,54 @@ export default function VersionPlanningView({ projectKeys }) {
                             : criticalPathKeys.has(row.key)
                             ? '0 0 0 2px rgba(255,153,31,0.3), 0 1px 4px rgba(0,0,0,0.18)'
                             : '0 1px 4px rgba(0,0,0,0.18)',
-                        }} title={`${row.key}: ${bar.startDate} → ${bar.endDate} (${bar.durationDays}d) — drag to move`}>
+                        }} title={`${row.key}: ${bar.startDate} → ${bar.endDate} (${bar.durationDays}d)${
+                          _lockedByChildren
+                            ? ` — spans ${bar.lockedChildKeys.length} stor${bar.lockedChildKeys.length === 1 ? 'y' : 'ies'} locked to their Jira dates; click 🔒 to unlock them`
+                            : _lockedDirectly
+                            ? " — locked to Jira's Start/Due dates; click 🔒 to unlock and move it"
+                            : remainingEstMap[row.key] === 0
+                            ? ' — no dev hours left (all stories dev-done); shown as a 1-day marker, with QA/Fix time still reserved after it'
+                            : ''
+                        }${_isLocked ? '' : ' — drag to move'}`}>
+                        {_lockedByChildren ? (
+                          <span onClick={e => { e.stopPropagation(); unlockAllChildren(bar.lockedChildKeys); }}
+                            title={`Locked by ${bar.lockedChildKeys.length} child stor${bar.lockedChildKeys.length === 1 ? 'y' : 'ies'} with Jira dates — click to unlock them`}
+                            style={{ fontSize: 10, color: '#fff', flexShrink: 0, cursor: 'pointer' }}>🔒</span>
+                        ) : _lockedDirectly && (
+                          <span onClick={e => { e.stopPropagation(); unlockJiraDates(row.key); }}
+                            title="Locked to Jira's Start/Due dates — click to unlock and drag freely"
+                            style={{ fontSize: 10, color: '#fff', flexShrink: 0, cursor: 'pointer' }}>🔒</span>
+                        )}
                         <span style={{ fontSize: 10, color: '#fff', fontWeight: 700, flexShrink: 0 }}>{bar.durationDays}d</span>
                         {phs.slice(0, 3).map(ph => (
-                          <span key={ph.id} title={ph.name} style={{
+                          <span key={ph.id} title={typeof ph.capacityPct === 'number' && ph.capacityPct < 100 ? `${ph.name} (${ph.capacityPct}% capacity)` : ph.name} style={{
                             width: 12, height: 12, borderRadius: '50%', background: 'rgba(255,255,255,0.35)',
-                            border: '1.5px solid rgba(255,255,255,0.7)', flexShrink: 0, fontSize: 8,
+                            border: typeof ph.capacityPct === 'number' && ph.capacityPct < 100 ? '1.5px dashed rgba(255,255,255,0.9)' : '1.5px solid rgba(255,255,255,0.7)',
+                            flexShrink: 0, fontSize: 8,
                             display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
                           }}>{ph.name[0]}</span>
                         ))}
                         <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.85)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                           {row.key}
                         </span>
-                        <button
-                          onClick={e => { e.stopPropagation(); updateIssueEntry(row.key, { startDate: null, dependencies: [] }); }}
-                          title="Remove from timeline"
-                          style={{
-                            position: 'absolute', right: 2, top: '50%', transform: 'translateY(-50%)',
-                            background: 'rgba(0,0,0,0.3)', border: 'none', borderRadius: '50%',
-                            width: 14, height: 14, cursor: 'pointer', color: '#fff', fontSize: 10,
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            lineHeight: 1, padding: 0,
-                          }}
-                        >×</button>
+                        {/* Hidden while locked (either way): if locked-by-children, the bar's
+                            span comes from those stories, not this epic's own entry, so
+                            clearing the epic's entry would silently do nothing; if locked
+                            directly, removing it here would just leave placeOnTimeline to
+                            re-lock it on the very next drop. Unlock via the 🔒 above instead. */}
+                        {!_isLocked && (
+                          <button
+                            onClick={e => { e.stopPropagation(); updateIssueEntry(row.key, { startDate: null, dependencies: [] }); }}
+                            title="Remove from timeline"
+                            style={{
+                              position: 'absolute', right: 2, top: '50%', transform: 'translateY(-50%)',
+                              background: 'rgba(0,0,0,0.3)', border: 'none', borderRadius: '50%',
+                              width: 14, height: 14, cursor: 'pointer', color: '#fff', fontSize: 10,
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              lineHeight: 1, padding: 0,
+                            }}
+                          >×</button>
+                        )}
                       </div>
                       {_qaDays > 0 && (
                         <div style={{
@@ -2654,7 +3459,7 @@ export default function VersionPlanningView({ projectKeys }) {
                       const _fStories = (storiesByEpic[row.key] || []).filter(s => computedPlan.issues?.[s.key]?.startDate);
                       const _fTotalHours = _fStories.reduce((s, st) => s + (roughMap[st.key] || 0), 0);
                       const _fAvgDevs = _fStories.length > 0
-                        ? Math.max(1, Math.round(_fStories.reduce((s, st) => s + ((computedPlan.issues?.[st.key]?.assignedPlaceholders || []).length || 1), 0) / _fStories.length))
+                        ? Math.max(1, _fStories.reduce((s, st) => s + effectiveDevCount(computedPlan.issues?.[st.key]?.assignedPlaceholders, computedPlan.placeholders), 0) / _fStories.length)
                         : 1;
                       const { qaDays: _fqd, bugFixDays: _fbfd } = calcQaBugFixDays(_fTotalHours, _fAvgDevs, qaMap[row.key] || 0, bugFixPct);
                       const _fQaLeft = sb.left + sb.width + 2;
@@ -2731,11 +3536,15 @@ export default function VersionPlanningView({ projectKeys }) {
                           position: 'absolute',
                           left: bar.left, top: 5,
                           width: bar.width, height: ROW_HEIGHT - 10,
-                          background: phs.length === 1 ? phs[0].color : phs.length > 1 ? `linear-gradient(90deg, ${phs.map(p => p.color).join(', ')})` : '#97A0AF',
-                          borderRadius: 4, cursor: 'grab', opacity: entry.borrowedFromParent ? 0.45 : 0.88,
+                          // Pinned to Jira's own Start/Due dates → deliberately grey, not the
+                          // developer's color: the bar's position is Jira's fact, not a plan choice.
+                          background: entry.jiraLocked
+                            ? '#8993A4'
+                            : phs.length === 1 ? phs[0].color : phs.length > 1 ? `linear-gradient(90deg, ${phs.map(p => p.color).join(', ')})` : '#97A0AF',
+                          borderRadius: 4, cursor: entry.jiraLocked ? 'not-allowed' : 'grab', opacity: entry.borrowedFromParent ? 0.45 : 0.88,
                           display: 'flex', alignItems: 'center', paddingLeft: 6, paddingRight: 18, gap: 4,
                           overflow: 'hidden', userSelect: 'none',
-                          border: conflictingKeys.has(row.key) ? '2px solid #FF5630' : bar.isActual ? '4px solid #00875A' : 'none',
+                          border: conflictingKeys.has(row.key) ? '2px solid #FF5630' : entry.jiraLocked ? '2px solid #5E6C84' : statusBorderColor(row.fields?.status?.name) ? `3px solid ${statusBorderColor(row.fields?.status?.name)}` : bar.isActual ? '4px solid #00875A' : 'none',
                           outline: criticalPathKeys.has(row.key) && !conflictingKeys.has(row.key) ? '2px solid #FF991F' : 'none',
                           outlineOffset: 1,
                           boxShadow: conflictingKeys.has(row.key)
@@ -2743,13 +3552,20 @@ export default function VersionPlanningView({ projectKeys }) {
                             : criticalPathKeys.has(row.key)
                             ? '0 0 0 2px rgba(255,153,31,0.3), 0 1px 4px rgba(0,0,0,0.18)'
                             : '0 1px 4px rgba(0,0,0,0.18)',
-                        }} title={`${row.key}: ${bar.startDate} → ${bar.endDate} (${bar.durationDays}d)${bar.isActual ? ' — actual dates from Jira status history' : ''}${entry.borrowedFromParent ? ' — dev inherited from parent story' : ''} — drag to move`}>
-                        {bar.isActual && <span style={{ fontSize: 9, color: '#fff', flexShrink: 0 }} title="Actual dates from Jira status history — drag to override">🔒</span>}
+                        }} title={`${row.key}: ${bar.startDate} → ${bar.endDate} (${bar.durationDays}d)${entry.jiraLocked ? " — locked to Jira's Start/Due dates; click the 🔒 to unlock and move it" : bar.isActual ? ' — actual dates from Jira status history' : ''}${entry.borrowedFromParent ? ' — dev inherited from parent story' : ''}${entry.jiraLocked ? '' : ' — drag to move'}`}>
+                        {entry.jiraLocked ? (
+                          <span onClick={e => { e.stopPropagation(); unlockJiraDates(row.key); }}
+                            title="Locked to Jira's Start/Due dates — click to unlock and drag freely"
+                            style={{ fontSize: 10, color: '#fff', flexShrink: 0, cursor: 'pointer' }}>🔒</span>
+                        ) : bar.isActual && (
+                          <span style={{ fontSize: 9, color: '#fff', flexShrink: 0 }} title="Actual dates from Jira status history — drag to override">🔒</span>
+                        )}
                         <span style={{ fontSize: 10, color: '#fff', fontWeight: 700, flexShrink: 0 }}>{bar.durationDays}d</span>
                         {phs.slice(0, 3).map(ph => (
-                          <span key={ph.id} title={ph.name} style={{
+                          <span key={ph.id} title={typeof ph.capacityPct === 'number' && ph.capacityPct < 100 ? `${ph.name} (${ph.capacityPct}% capacity)` : ph.name} style={{
                             width: 12, height: 12, borderRadius: '50%', background: 'rgba(255,255,255,0.35)',
-                            border: '1.5px solid rgba(255,255,255,0.7)', flexShrink: 0, fontSize: 8,
+                            border: typeof ph.capacityPct === 'number' && ph.capacityPct < 100 ? '1.5px dashed rgba(255,255,255,0.9)' : '1.5px solid rgba(255,255,255,0.7)',
+                            flexShrink: 0, fontSize: 8,
                             display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
                           }}>{ph.name[0]}</span>
                         ))}
@@ -2801,26 +3617,46 @@ export default function VersionPlanningView({ projectKeys }) {
                   />
                 )}
 
-                {/* Milestone vertical lines — CLICKABLE to edit */}
+                {/* Sprint start/end lines — grey dotted, read-only reference pulled straight from
+                    Jira's own sprint schedule for this project (useSprints), not editable here.
+                    Drawn at the day-column edges (not the center, unlike today/milestone lines)
+                    so they visually bracket the sprint's date range. */}
+                {sprints.map(sprint => {
+                  const startDateStr = sprint.startDate ? snapToWorkingDay(sprint.startDate.slice(0, 10)) : null;
+                  const endDateStr = sprint.endDate ? snapToWorkingDay(sprint.endDate.slice(0, 10)) : null;
+                  const startIdx = startDateStr ? workingDays.indexOf(startDateStr) : -1;
+                  const endIdx = endDateStr ? workingDays.indexOf(endDateStr) : -1;
+                  if (startIdx < 0 && endIdx < 0) return null;
+                  const svgH = HEADER_H + sortedRows.length * ROW_HEIGHT;
+                  return (
+                    <g key={sprint.id} style={{ pointerEvents: 'none' }}>
+                      {startIdx >= 0 && (<>
+                        <line x1={startIdx * DAY_WIDTH} y1={HEADER_H} x2={startIdx * DAY_WIDTH} y2={svgH}
+                          stroke="#97A0AF" strokeWidth={1.5} strokeDasharray="2 3" />
+                        <text x={startIdx * DAY_WIDTH + 3} y={HEADER_H - 3} fontSize={8} fill="#97A0AF">{sprint.name}</text>
+                      </>)}
+                      {endIdx >= 0 && (
+                        <line x1={(endIdx + 1) * DAY_WIDTH} y1={HEADER_H} x2={(endIdx + 1) * DAY_WIDTH} y2={svgH}
+                          stroke="#97A0AF" strokeWidth={1.5} strokeDasharray="2 3" />
+                      )}
+                    </g>
+                  );
+                })}
+
+                {/* Milestone vertical lines — the label pill itself now lives in the sticky
+                    header above (see the block right after the date-header day cells) since it
+                    was rendering BEHIND that header's own stacking context here — invisible and
+                    unclickable. The dashed line down through the rows still lives here and is
+                    independently clickable to edit, same as before. */}
                 {(computedPlan.milestones || []).map(m => {
                   const idx = workingDays.indexOf(m.date);
                   if (idx < 0) return null;
                   const x = idx * DAY_WIDTH + DAY_WIDTH / 2;
                   return (
-                    <g key={m.id} onClick={() => setEditingMilestone({ ...m })}
-                      style={{ cursor: 'pointer', pointerEvents: 'auto' }}>
-                      {/* Wide invisible hit area — ONLY around the label pill near the header, not
-                          the full column height. A full-height hit rect used to sit on top of every
-                          bar in this date column (SVG overlay paints after the row bars), silently
-                          swallowing clicks/drags meant for any bar under a milestone's date. */}
-                      <rect x={x - 8} y={HEADER_H - 20} width={16} height={24}
-                        fill="transparent" />
-                      <line x1={x} y1={HEADER_H} x2={x} y2={HEADER_H + sortedRows.length * ROW_HEIGHT}
-                        stroke={m.color} strokeWidth={2} strokeDasharray="5 3" style={{ pointerEvents: 'stroke' }} />
-                      <rect x={x - 1} y={HEADER_H - 16} width={Math.max(m.label.length * 6.5, 20)} height={14}
-                        fill={m.color + 'dd'} rx={2} />
-                      <text x={x + 2} y={HEADER_H - 5} fontSize={9} fill="#fff" fontWeight="bold">{m.label}</text>
-                    </g>
+                    <line key={m.id} onClick={() => setEditingMilestone({ ...m })}
+                      x1={x} y1={HEADER_H} x2={x} y2={HEADER_H + sortedRows.length * ROW_HEIGHT}
+                      stroke={m.color} strokeWidth={2} strokeDasharray="5 3"
+                      style={{ pointerEvents: 'stroke', cursor: 'pointer' }} />
                   );
                 })}
 
@@ -2876,8 +3712,8 @@ export default function VersionPlanningView({ projectKeys }) {
                     // In draft mode, arrow leaves from end of QA+bugfix bar, not just dev bar
                     let arrowSrcX = sourceBar.left + sourceBar.width;
                     if (planningMode === 'draft') {
-                      const _sDevs = (computedPlan.issues?.[depKey]?.assignedPlaceholders || []).length || 1;
-                      const { qaDays: _sqd, bugFixDays: _sbfd } = calcQaBugFixDays(roughMap[depKey], _sDevs, qaMap[depKey] || 0, bugFixPct);
+                      const _sDevs = effectiveDevCount(computedPlan.issues?.[depKey]?.assignedPlaceholders, computedPlan.placeholders);
+                      const { qaDays: _sqd, bugFixDays: _sbfd } = calcQaBugFixDays(qaBaseMap[depKey], _sDevs, qaMap[depKey] || 0, bugFixPct);
                       arrowSrcX = sourceBar.left + (sourceBar.durationDays + _sqd + _sbfd) * DAY_WIDTH - 2;
                     }
                     const sx = arrowSrcX;
@@ -2885,13 +3721,28 @@ export default function VersionPlanningView({ projectKeys }) {
                     const tx = targetBar.left;
                     const ty = HEADER_H + rowIdx * ROW_HEIGHT + ROW_HEIGHT / 2;
                     const cx = sx + Math.abs(tx - sx) / 2;
+                    // Midpoint of the cubic at t=0.5, for placing the ⇄ reverse handle.
+                    const mx = 0.125 * sx + 0.375 * cx + 0.375 * cx + 0.125 * tx;
+                    const my = 0.125 * sy + 0.375 * sy + 0.375 * ty + 0.125 * ty;
                     return (
-                      <path key={`${depKey}->${row.key}`}
-                        d={`M ${sx} ${sy} C ${cx} ${sy} ${cx} ${ty} ${tx} ${ty}`}
-                        stroke="#0052CC" strokeWidth={1.5} fill="none" markerEnd="url(#arrow)"
-                        style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
-                        onClick={() => removeDependency(depKey, row.key)}
-                      />
+                      <g key={`${depKey}->${row.key}`}>
+                        <path
+                          d={`M ${sx} ${sy} C ${cx} ${sy} ${cx} ${ty} ${tx} ${ty}`}
+                          stroke="#0052CC" strokeWidth={1.5} fill="none" markerEnd="url(#arrow)"
+                          style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+                          onClick={e => { if (e.shiftKey) reverseDependency(depKey, row.key); else removeDependency(depKey, row.key); }}
+                        >
+                          <title>{`${depKey} → ${row.key}: click the line to remove, Shift+click (or the ⇄ handle) to reverse`}</title>
+                        </path>
+                        {/* ⇄ handle — reverses the direction. Needs pointerEvents 'auto'
+                            because the whole SVG overlay is 'none' (see the root <svg>). */}
+                        <g style={{ pointerEvents: 'auto', cursor: 'pointer' }}
+                          onClick={e => { e.stopPropagation(); reverseDependency(depKey, row.key); }}>
+                          <title>{`Reverse: make ${row.key} run before ${depKey}`}</title>
+                          <circle cx={mx} cy={my} r={7} fill="#fff" stroke="#0052CC" strokeWidth={1.25} />
+                          <text x={mx} y={my + 3} textAnchor="middle" fontSize={9} fontWeight="bold" fill="#0052CC">⇄</text>
+                        </g>
+                      </g>
                     );
                   });
                 })}
@@ -2948,6 +3799,291 @@ export default function VersionPlanningView({ projectKeys }) {
           </div>
         </div>
       )}
+      </div>
+
+      {/* ── Right-hand side panel — one tab open at a time ── */}
+      {activePanel && selectedPlanId && (
+        <SidePanel
+          title={
+            activePanel === 'summary' ? '📊 Summary' :
+            activePanel === 'settings' ? '⚙ Settings' :
+            activePanel === 'team' ? '👥 Team' :
+            activePanel === 'tools' ? '🔗 Tools' :
+            '🐛 Debug'
+          }
+          onClose={() => setActivePanel(null)}
+        >
+          {activePanel === 'summary' && (
+            <SummaryPanelContent
+              computedPlan={computedPlan}
+              roughMapArg={schedMap}
+              rows={rows}
+              conflicts={conflicts}
+              missingEstMap={missingEstMap}
+              estSource={estSource}
+              planningMode={planningMode}
+              updateIssueEntry={updateIssueEntry}
+            />
+          )}
+
+          {activePanel === 'settings' && (
+            <div style={{ padding: 14, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div>
+                  <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Estimate source</div>
+                  <div style={{ display: 'flex', border: '1.5px solid #DFE1E6', borderRadius: 4, overflow: 'hidden', width: 'fit-content' }}>
+                    <button onClick={() => setEstSource('rough')} style={{
+                      padding: '5px 12px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      background: estSource === 'rough' ? '#0052CC' : '#fff',
+                      color: estSource === 'rough' ? '#fff' : '#42526E', border: 'none',
+                    }} title="Use the Rough Estimation custom field">Rough Est</button>
+                    <button onClick={() => setEstSource('children')} style={{
+                      padding: '5px 12px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      background: estSource === 'children' ? '#0052CC' : '#fff',
+                      color: estSource === 'children' ? '#fff' : '#42526E',
+                      border: 'none', borderLeft: '1px solid #DFE1E6',
+                    }} title={planningMode === 'draft' ? "Sum each epic's stories' original estimates" : "Sum children's (tasks/subtasks) original estimates"}>Children Sum</button>
+                  </div>
+                </div>
+
+              {planningMode === 'draft' && (
+                <div>
+                  <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Dependencies</div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#42526E', cursor: 'pointer' }}
+                    title="When you drop an epic, automatically chain it behind the latest epic before it that shares a developer — one person can't work two epics at once. The bar snaps to just after that epic rather than exactly where you released it.">
+                    <input type="checkbox" checked={autoDepByDev} onChange={e => setAutoDepByDev(e.target.checked)} />
+                    Auto-chain epics sharing a developer
+                  </label>
+                </div>
+              )}
+
+              {planningMode === 'draft' && (
+                <div>
+                  <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>QA / bug-fix / stabilization</div>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <label style={{ color: '#5E6C84', fontWeight: 600 }}>Bug fix:</label>
+                    <input type="number" value={bugFixPct} min={0} max={100}
+                      onChange={e => setBugFixPct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                      title="% of dev time developers spend fixing bugs after QA"
+                      style={{ width: 46, padding: '4px 6px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
+                    <span style={{ color: '#5E6C84' }}>%</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+                    <label style={{ color: '#5E6C84', fontWeight: 600 }}>Freeze:</label>
+                    <input type="number" value={codeFreezeDays} min={0}
+                      onChange={e => setCodeFreezeDays(Math.max(0, Number(e.target.value)))}
+                      title="Working days between last epic and code freeze"
+                      style={{ width: 40, padding: '4px 6px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
+                    <span style={{ color: '#5E6C84' }}>d</span>
+                    <label style={{ color: '#5E6C84', fontWeight: 600, marginLeft: 6 }}>Stab:</label>
+                    <input type="number" value={stabilizationDays} min={0}
+                      onChange={e => setStabilizationDays(Math.max(0, Number(e.target.value)))}
+                      title="Working days of stabilization after code freeze"
+                      style={{ width: 40, padding: '4px 6px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
+                    <span style={{ color: '#5E6C84' }}>d</span>
+                  </div>
+                </div>
+              )}
+
+              {planningMode === 'epic' && (
+                <div>
+                  <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Dependency buffer</div>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                    <label style={{ color: '#5E6C84', fontWeight: 600 }}>Buffer:</label>
+                    <input type="number" value={bufferDays} min={0}
+                      onChange={e => setBufferDays(Math.max(0, Number(e.target.value)))}
+                      title="Extra working days after a dependency ends before its dependent can start"
+                      style={{ width: 40, padding: '4px 6px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
+                    <span style={{ color: '#5E6C84' }}>d</span>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Plan start date</div>
+                <input type="date" value={planStart} onChange={e => setPlanStart(snapToWorkingDay(e.target.value))}
+                  style={{ padding: '5px 8px', fontSize: 12, border: '1.5px solid #DFE1E6', borderRadius: 4 }} />
+              </div>
+
+              {selectedPlanId && !isFinalContext && (
+                <div>
+                  <div style={{ fontWeight: 700, color: '#172B4D', marginBottom: 6 }}>Plan management</div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button onClick={() => setPlanDialog({ type: 'saveas', defaultName: (planIndex.find(p => p.id === selectedPlanId)?.name || '') + ' (copy)' })}
+                      style={btnStyle('#E9F2FF', '#0052CC', '#B3D4FF')}>Save as…</button>
+                    <button onClick={() => setPlanDialog({ type: 'rename', planId: selectedPlanId, defaultName: planIndex.find(p => p.id === selectedPlanId)?.name || '' })}
+                      style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>Rename</button>
+                    <button onClick={() => setPlanDialog({ type: 'delete', planId: selectedPlanId })}
+                      style={btnStyle('#FFEBE6', '#DE350B', '#FF8F73')}>Delete</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activePanel === 'team' && (
+            <div style={{ padding: 14, fontSize: 12 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {(plan.placeholders || []).map(ph => (
+                  <div key={ph.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {editingPhId === ph.id ? (
+                      <input autoFocus value={editingPhValue}
+                        onChange={e => setEditingPhValue(e.target.value)}
+                        onBlur={() => { renamePlaceholder(ph.id, editingPhValue); setEditingPhId(null); }}
+                        onKeyDown={e => { if (e.key === 'Enter') { renamePlaceholder(ph.id, editingPhValue); setEditingPhId(null); } }}
+                        style={{ width: 120, fontSize: 12, border: `1.5px solid ${ph.color}`, borderRadius: 4, padding: '3px 6px' }}
+                      />
+                    ) : (
+                      <>
+                        <Chip label={ph.name} color={ph.color} initials={devInitials(ph.name)}
+                          selected={focusDevId === ph.id}
+                          onClick={() => setFocusDevId(prev => prev === ph.id ? null : ph.id)}
+                          onRemove={() => removePlaceholder(ph.id)} />
+                        <span style={{ fontSize: 10, color: '#97A0AF', flexShrink: 0 }}>
+                          {assignedCountByDev[ph.id] || 0}
+                        </span>
+                        <span onClick={() => { setEditingPhId(ph.id); setEditingPhValue(ph.name); }}
+                          title="Rename" style={{ cursor: 'pointer', fontSize: 11, color: '#97A0AF', padding: '0 2px' }}>✎</span>
+                      </>
+                    )}
+                    <input type="number" min={1} max={100}
+                      value={typeof ph.capacityPct === 'number' ? ph.capacityPct : 100}
+                      onChange={e => setPlaceholderCapacity(ph.id, Number(e.target.value))}
+                      title={`% of a full day this developer works on this plan — e.g. 80% = ${(HOURS_PER_DAY * 0.8).toFixed(1)}h/day instead of ${HOURS_PER_DAY}h/day`}
+                      style={{ width: 42, marginLeft: 'auto', padding: '3px 5px', fontSize: 11, border: '1.5px solid #DFE1E6', borderRadius: 4, textAlign: 'center' }} />
+                    <span style={{ fontSize: 11, color: '#5E6C84' }}>%</span>
+                  </div>
+                ))}
+                {!(plan.placeholders || []).length && <span style={{ color: '#97A0AF' }}>No developers yet — add one below.</span>}
+              </div>
+
+              {focusDevId && (
+                <button onClick={() => setFocusDevId(null)}
+                  style={{ ...btnStyle('#FFEBE6', '#DE350B', '#FF8F73'), padding: '4px 10px', fontSize: 11, marginTop: 10 }}>
+                  ✕ Show all (clear developer filter)
+                </button>
+              )}
+
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 12 }}>
+                <input value={newPhName} onChange={e => setNewPhName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && newPhName.trim()) { addPlaceholder(newPhName); setNewPhName(''); } }}
+                  placeholder="+ Add developer"
+                  style={{ fontSize: 12, border: '1.5px dashed #B3D4FF', borderRadius: 4, padding: '5px 8px', flex: 1, outline: 'none' }}
+                />
+                {newPhName.trim() && (
+                  <button onClick={() => { addPlaceholder(newPhName); setNewPhName(''); }}
+                    style={{ ...btnStyle('#E9F2FF', '#0052CC', '#B3D4FF'), padding: '4px 10px', fontSize: 11 }}>Add</button>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>
+                <button onClick={recolorPlaceholders} title="Reassign every developer's color from the current palette — fixes similar/duplicate colors"
+                  style={{ ...btnStyle('#F4F5F7', '#42526E', '#DFE1E6'), padding: '4px 10px', fontSize: 11 }}>
+                  🎨 Fix colors
+                </button>
+                <button onClick={pruneUnusedPlaceholders}
+                  title="Remove every developer who isn't assigned to any issue in this plan. They won't be re-detected from Jira assignees afterwards — use ↺ Re-detect to undo."
+                  style={{ ...btnStyle('#FFF0B3', '#974F0C', '#FFD700'), padding: '4px 10px', fontSize: 11 }}>
+                  🧹 Keep only assigned
+                </button>
+                {(plan.dismissedAccountIds || []).length > 0 && (
+                  <button onClick={resetDismissedAssignees}
+                    title={`${(plan.dismissedAccountIds || []).length} removed developer(s) are being kept out of auto-detection — click to allow them back from Jira assignees`}
+                    style={{ ...btnStyle('#E9F2FF', '#0052CC', '#B3D4FF'), padding: '4px 10px', fontSize: 11 }}>
+                    ↺ Re-detect ({(plan.dismissedAccountIds || []).length})
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {activePanel === 'tools' && (
+            <div style={{ padding: 14, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <button onClick={() => { setDepsMode(m => !m); setDepsSource(null); }}
+                style={btnStyle(depsMode ? '#FFF0B3' : '#F4F5F7', depsMode ? '#974F0C' : '#42526E', depsMode ? '#FFD700' : '#DFE1E6')}>
+                {depsMode ? (depsSource ? `→ Click target` : '→ Click source') : '+ Dependency'}
+              </button>
+              <button onClick={() => setEditingMilestone({ id: null, label: '', date: workingDays[10] || TODAY_STR, color: MILESTONE_COLORS[0] })}
+                style={btnStyle('#F4F5F7', '#42526E', '#DFE1E6')}>
+                + Milestone
+              </button>
+              {planningMode === 'epic' && (
+                <button onClick={exportTimelineHtml} title="Download a self-contained HTML report: summary, timeline, milestones, critical path, team utilization, and the full debug table"
+                  style={btnStyle('#E9F2FF', '#0052CC', '#B3D4FF')}>
+                  ⬇ Export HTML
+                </button>
+              )}
+              <button onClick={exportPlanJson} disabled={!selectedPlanId}
+                title="Download the full plan as JSON — dates, assignees, capacities, estimates, conflicts, everything the app knows. Works in every mode; handy for debugging a number that looks wrong, or feeding a dashboard."
+                style={{ ...btnStyle('#EAE6FF', '#403294', '#C0B6F2'), opacity: selectedPlanId ? 1 : 0.5 }}>
+                ⬇ Export JSON
+              </button>
+              <div style={{ borderTop: '1px solid #DFE1E6', marginTop: 4, paddingTop: 10 }}>
+                <button onClick={() => setPlanDialog({ type: 'clearAllScheduling' })} title="Unschedule everything in view — keeps developers and milestones"
+                  style={{ ...btnStyle('#FFF0B3', '#974F0C', '#FFD700'), width: '100%' }}>
+                  Clear all scheduling
+                </button>
+                <button onClick={() => setPlanDialog({ type: 'clear' })}
+                  style={{ ...btnStyle('#FFEBE6', '#DE350B', '#FF8F73'), width: '100%', marginTop: 8 }}>
+                  Clear plan
+                </button>
+              </div>
+            </div>
+          )}
+
+          {activePanel === 'debug' && planningMode === 'epic' && (
+            <div style={{ fontSize: 11 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '1px solid #DFE1E6' }}>
+                <strong style={{ color: '#172B4D' }}>{focusEpicKey || '(no epic selected)'} — {debugRows.length} rows</strong>
+                <button
+                  onClick={() => {
+                    const cols = ['key', 'type', 'parentKey', 'status', 'jiraAssignee', 'assignedDevs', 'borrowedFromParent', 'startDate', 'endDate', 'isActual', 'historyResolved', 'roughHours', 'dependencies'];
+                    const header = cols.join('\t');
+                    const lines = debugRows.map(r => cols.map(c => String(r[c] ?? '')).join('\t'));
+                    const text = [header, ...lines].join('\n');
+                    navigator.clipboard.writeText(text).then(() => {
+                      setDebugCopied(true);
+                      setTimeout(() => setDebugCopied(false), 2000);
+                    }).catch(() => {});
+                  }}
+                  style={{ marginLeft: 'auto', padding: '3px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', borderRadius: 4, border: '1px solid #DFE1E6', background: debugCopied ? '#00875A' : '#F4F5F7', color: debugCopied ? '#fff' : '#42526E' }}>
+                  {debugCopied ? '✓ Copied' : '⎘ Copy table'}
+                </button>
+              </div>
+              <div style={{ overflow: 'auto' }}>
+                <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                  <thead>
+                    <tr style={{ background: '#F4F5F7' }}>
+                      {['Key', 'Type', 'Parent', 'Status', 'Assignee', 'Dev(s)', 'Borrowed?', 'Start', 'End', 'Actual?', 'Resolved?', 'Hrs', 'Deps'].map(h => (
+                        <th key={h} style={{ padding: '4px 6px', textAlign: 'left', borderBottom: '1px solid #DFE1E6', whiteSpace: 'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {debugRows.map(r => (
+                      <tr key={r.key} style={{ borderBottom: '1px solid #F4F5F7' }}>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap', fontWeight: r.type !== 'Subtask' ? 700 : 400 }}>{r.key}</td>
+                        <td style={{ padding: '3px 6px' }}>{r.type}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap' }}>{r.parentKey}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap' }}>{r.status}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap' }}>{r.jiraAssignee}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap' }}>{r.assignedDevs}</td>
+                        <td style={{ padding: '3px 6px' }}>{r.borrowedFromParent ? 'yes' : ''}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap', color: '#0052CC' }}>{r.startDate}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap', color: '#0052CC' }}>{r.endDate}</td>
+                        <td style={{ padding: '3px 6px' }}>{r.isActual ? '🔒' : ''}</td>
+                        <td style={{ padding: '3px 6px' }}>{r.historyResolved ? '✓' : ''}</td>
+                        <td style={{ padding: '3px 6px' }}>{r.roughHours}</td>
+                        <td style={{ padding: '3px 6px', whiteSpace: 'nowrap' }}>{r.dependencies}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </SidePanel>
+      )}
+      </div>
 
       {/* ── Milestone editor dialog ── */}
       {editingMilestone !== null && (
@@ -3011,7 +4147,7 @@ export default function VersionPlanningView({ projectKeys }) {
       {!maximized && selectedPlanId && (
         <DeliveryReport
           computedPlan={computedPlan}
-          roughMap={roughMap}
+          roughMap={schedMap}
           planName={planIndex.find(p => p.id === selectedPlanId)?.name}
           mode={planningMode}
           codeFreezeDate={planningMode === 'draft' ? codeFreezeDate : null}
@@ -3033,6 +4169,7 @@ export default function VersionPlanningView({ projectKeys }) {
             setSelectedPlanId(remaining[0] ? remaining[0].id : null);
           }}
           onClear={async function() { clearPlan(); }}
+          onClearAllScheduling={async function(removeJiraDueDates) { await clearAllScheduling(removeJiraDueDates); }}
         />
       )}
 
