@@ -1015,6 +1015,7 @@ export default function VersionPlanningView({ projectKeys }) {
   const [depNote, setDepNote] = useState(null); // transient feedback for reverse/remove dependency actions
   const [refreshNote, setRefreshNote] = useState(null); // transient feedback after "Refresh from Jira"
   const [refreshing, setRefreshing] = useState(false);
+  const [shareNote, setShareNote] = useState(null); // transient feedback after "Share"
   const [editingMilestone, setEditingMilestone] = useState(null);
   const [saveStatus, setSaveStatus] = useState(null);
   const [newPhName, setNewPhName] = useState('');
@@ -1077,6 +1078,11 @@ export default function VersionPlanningView({ projectKeys }) {
     const t = setTimeout(() => setRefreshNote(null), 8000);
     return () => clearTimeout(t);
   }, [refreshNote]);
+  useEffect(() => {
+    if (!shareNote) return;
+    const t = setTimeout(() => setShareNote(null), 6000);
+    return () => clearTimeout(t);
+  }, [shareNote]);
   const { sprints, error: sprintsError } = useSprints(projectKeys);
   useEffect(() => {
     if (sprintsError) {
@@ -1999,6 +2005,32 @@ export default function VersionPlanningView({ projectKeys }) {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  }
+
+  // Plans are stored centrally in Jira (project properties), not per-user — any teammate with
+  // access to this project who opens K1-Planner and picks the same Project/Version/Plan is
+  // looking at, and can edit, this exact same stored plan (not a copy). That's already true
+  // with zero extra work; what's missing is a fast way to tell them WHICH one to pick, so this
+  // copies a plain-text pointer rather than a magic auto-loading link — Forge strips URL query
+  // parameters/hash fragments on a fresh (cold) load from a shared link, so a one-click deep
+  // link into this exact plan isn't reliably possible on the platform today.
+  function sharePlan() {
+    const ver = versions.find(v => v.id === selectedVersionId);
+    const planName = planIndex.find(p => p.id === selectedPlanId)?.name || '(unnamed plan)';
+    const modeLabel = planningMode === 'draft' ? 'Draft' : planningMode === 'final' ? 'Final' : 'Epic Timeline';
+    const epicLine = planningMode === 'epic' && focusEpicKey ? `\nEpic: ${focusEpicKey}` : '';
+    const text = [
+      `K1-Planner — shared plan`,
+      `Project: ${projectKeys.join(', ')}`,
+      `Version: ${ver ? ver.name : selectedVersionId}`,
+      `Mode: ${modeLabel}${epicLine}`,
+      `Plan: "${planName}"`,
+      ``,
+      `To open it: Jira → Apps → K1-Planner, then select the project/version/mode/plan above. You'll see and can edit the exact same plan — it's stored in Jira, not just on this device.`,
+    ].join('\n');
+    navigator.clipboard.writeText(text)
+      .then(() => setShareNote('📋 Copied — paste it in Slack, email, wherever your teammate will see it'))
+      .catch(() => setShareNote("✗ Couldn't copy to clipboard — your browser may be blocking it"));
   }
 
   // Full structured dump of the current plan — dates, assignees, capacities, estimates,
@@ -4002,6 +4034,16 @@ export default function VersionPlanningView({ projectKeys }) {
                 style={{ ...btnStyle('#EAE6FF', '#403294', '#C0B6F2'), opacity: selectedPlanId ? 1 : 0.5 }}>
                 ⬇ Export JSON
               </button>
+              <button onClick={sharePlan} disabled={!selectedPlanId}
+                title="Copy a pointer to this exact plan for a teammate — they'll see and can edit the same stored plan, not a copy. Plans live in Jira, so anyone with access to this project can already open it; this just tells them which project/version/plan to pick."
+                style={{ ...btnStyle('#E3FCEF', '#00875A', '#ABF5D1'), opacity: selectedPlanId ? 1 : 0.5 }}>
+                🔗 Share plan
+              </button>
+              {shareNote && (
+                <div style={{ fontSize: 11, color: shareNote.startsWith('✗') ? '#DE350B' : '#00875A', padding: '2px 2px 0' }}>
+                  {shareNote}
+                </div>
+              )}
               <div style={{ borderTop: '1px solid #DFE1E6', marginTop: 4, paddingTop: 10 }}>
                 <button onClick={() => setPlanDialog({ type: 'clearAllScheduling' })} title="Unschedule everything in view — keeps developers and milestones"
                   style={{ ...btnStyle('#FFF0B3', '#974F0C', '#FFD700'), width: '100%' }}>

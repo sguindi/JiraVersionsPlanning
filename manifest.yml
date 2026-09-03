@@ -4,12 +4,22 @@ modules:
       title: K1-Planner
       layout: basic
       resource: main
+      # icon isn't supported on the top-level jira:globalPage module at all (confirmed against
+      # Atlassian's manifest reference) — it only exists on `pages` sub-entries. A single-entry
+      # pages array is otherwise a no-op (same one destination, same resource) purely to unlock
+      # the icon field via Forge's bundled-resource syntax (resource:<key>;<path>).
+      pages:
+        - title: K1-Planner
+          route: app
+          icon: resource:icon;icon.svg
 
 resources:
   - key: main
     path: static/app/build
     tunnel:
       port: 3000
+  - key: icon
+    path: static/app/public
 
 app:
   id: ari:cloud:ecosystem::app/dfccc25b-0e9b-467e-a703-9a0e66cfae4f
