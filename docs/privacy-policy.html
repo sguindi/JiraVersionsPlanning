@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K1-Planner Privacy Policy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&family=Source+Sans+3:wght@400;500;600;700&display=swap">
+<style>
+  :root{
+    --paper:#FBFAF8; --ink:#1C2024; --ink-soft:#4A5058; --line:#E2DFD9;
+    --accent:#2452C8; --accent-soft:#EEF2FC;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#15171B; --ink:#EDEEF0; --ink-soft:#A6ACB5; --line:#2B2F36;
+      --accent:#7C9EFF; --accent-soft:#1C2333;
+    }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:'Source Sans 3',system-ui,-apple-system,Segoe UI,sans-serif;
+    font-size:16px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .page{max-width:700px; margin:0 auto; padding:64px 24px 100px;}
+  .eyebrow{
+    font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--accent);
+    font-weight:600; margin:0 0 14px;
+  }
+  h1{
+    font-family:'Source Serif 4',Georgia,serif; font-weight:600; font-size:38px;
+    margin:0 0 8px; letter-spacing:-.01em;
+  }
+  .updated{color:var(--ink-soft); font-size:14px; margin:0 0 40px;}
+  .summary{
+    background:var(--accent-soft); border:1px solid var(--line); border-radius:10px;
+    padding:20px 22px; margin-bottom:40px; font-size:15.5px; color:var(--ink);
+  }
+  .summary p{margin:0;}
+  h2{
+    font-family:'Source Serif 4',Georgia,serif; font-weight:600; font-size:21px;
+    margin:44px 0 14px; letter-spacing:-.005em;
+  }
+  p{margin:0 0 16px; max-width:62ch;}
+  ul{margin:0 0 16px; padding-left:22px;}
+  li{margin-bottom:6px; max-width:60ch;}
+  strong{font-weight:600;}
+  a{color:var(--accent);}
+  .contact{
+    margin-top:48px; padding-top:24px; border-top:1px solid var(--line);
+    font-size:14.5px; color:var(--ink-soft);
+  }
+  .contact a{color:var(--accent); font-weight:600;}
+</style>
+</head>
+<body>
+  <div class="page">
+    <p class="eyebrow">K1-Planner &middot; Legal</p>
+    <h1>Privacy Policy</h1>
+    <p class="updated">Last updated: September 3, 2026</p>
+
+    <div class="summary">
+      <p>K1-Planner reads and writes data only within your own Jira site, using Atlassian's own APIs. It sends data to no server of ours or any third party, uses no analytics or tracking, and never sells or shares data with anyone.</p>
+    </div>
+
+    <h2>What data the app accesses</h2>
+    <p>To do its job, K1-Planner reads the following from your Jira site, using the permissions you grant on install:</p>
+    <ul>
+      <li><strong>Projects, issues, and their fields</strong> &mdash; epics, stories, subtasks, statuses, assignees, estimates, due dates, fix versions, sprints, and issue change history &mdash; to build the planning views.</li>
+      <li><strong>User profile information</strong> &mdash; display names of assignees, for showing who's assigned to what.</li>
+    </ul>
+    <p>The app does not access data outside the Jira site it's installed on, and does not access Confluence, Bitbucket, or any other Atlassian product.</p>
+
+    <h2>What data the app stores, and where</h2>
+    <p>K1-Planner stores its own planning data &mdash; draft plans, developer capacity settings, milestones, and similar app configuration &mdash; as <strong>Jira entity properties</strong>, a storage mechanism Atlassian provides, attached directly to your Jira projects and issues. This data:</p>
+    <ul>
+      <li>Lives inside your Jira site's own Atlassian-hosted infrastructure, in the same data residency region as the rest of your Jira data.</li>
+      <li>Is never copied to, or processed by, any external server &mdash; K1-Planner has no backend of its own. It runs entirely as a Forge app on Atlassian's platform, plus a browser-side UI.</li>
+      <li>Is deleted when you uninstall the app or delete the underlying Jira project or issue.</li>
+    </ul>
+
+    <h2>Third parties</h2>
+    <p>K1-Planner does not integrate with, or send data to, any third-party service, analytics provider, or advertising network. The app makes no external network calls at all &mdash; every request it makes goes to Jira's own REST API on your site.</p>
+
+    <h2>Changes to this policy</h2>
+    <p>If what the app accesses or stores changes in a future version, this page will be updated and the date above will change accordingly.</p>
+
+    <div class="contact">
+      Questions about this policy or the app's data handling:<br>
+      <a href="mailto:sguindi@gmail.com">sguindi@gmail.com</a>
+    </div>
+  </div>
+</body>
+</html>
