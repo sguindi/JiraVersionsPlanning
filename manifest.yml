@@ -1,7 +1,7 @@
 modules:
   jira:globalPage:
     - key: plan-jira-page
-      title: planJira
+      title: K1-Planner
       layout: basic
       resource: main
 

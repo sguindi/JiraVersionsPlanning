@@ -2473,13 +2473,6 @@ export default function VersionPlanningView({ projectKeys }) {
       return NOT_STARTED_STATUSES.includes(statusName);
     }).sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
 
-    // eslint-disable-next-line no-console
-    console.log('[autoScheduleAll] epic=' + focusEpicKey,
-      'stories=' + stories.length, 'leaves=' + leaves.length,
-      'alreadyDated=' + leaves.filter(r => newIssues[r.key]?.startDate).length,
-      'notStartedToSchedule=' + notStartedLeaves.length,
-      'notStartedKeys=', notStartedLeaves.map(r => r.key));
-
     // Resolve "already started" issues' real dates FIRST, before anything below reads their
     // startDate/actualEndDate — this must run before the dev-availability pre-seed and the
     // not-started scheduling loop, or a dev's real, already-placed-but-not-yet-resolved
@@ -2624,14 +2617,6 @@ export default function VersionPlanningView({ projectKeys }) {
       return next;
     });
 
-    // eslint-disable-next-line no-console
-    console.log('[autoScheduleAll] result — leaves with a startDate now:',
-      leaves.map(r => ({
-        key: r.key,
-        startDate: newIssues[r.key]?.startDate || null,
-        inVisibleWindow: newIssues[r.key]?.startDate ? workingDays.includes(newIssues[r.key].startDate) : null,
-        devs: (newIssues[r.key]?.assignedPlaceholders || []).length,
-      })));
 
     updatePlan(prev => ({ ...prev, issues: newIssues }));
   }
