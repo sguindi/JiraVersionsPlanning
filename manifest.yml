@@ -2,7 +2,6 @@ modules:
   jira:globalPage:
     - key: plan-jira-page
       title: K1-Planner
-      icon: icon.svg
       layout: basic
       resource: main
 
